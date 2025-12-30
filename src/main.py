@@ -15,7 +15,7 @@ from fsm_decision import FSMDecision, State
 from controller import VehicleController
 
 # ============================
-# 0. 数据日志
+# 0. 数据日志 (保持不变)
 # ============================
 class DataLogger:
     def __init__(self, filename="simulation_log.csv"):
@@ -39,7 +39,7 @@ class DataLogger:
         self.file.close()
 
 # ============================
-# 1. 录像模块
+# 1. 录像模块 (保持不变)
 # ============================
 class SyncVideoRecorder:
     def __init__(self, vehicle, world, width=800, height=600, fps=20):
@@ -61,7 +61,8 @@ class SyncVideoRecorder:
         self.camera_bp.set_attribute('image_size_x', str(width))
         self.camera_bp.set_attribute('image_size_y', str(height))
         self.camera_bp.set_attribute('sensor_tick', str(1.0 / fps))
-        self.transform = carla.Transform(carla.Location(x=-6, z=4), carla.Rotation(pitch=-15))
+        # 录像机位也调整得更好看一点
+        self.transform = carla.Transform(carla.Location(x=-6, z=3), carla.Rotation(pitch=-15))
 
     def start(self):
         self.sensor = self.world.spawn_actor(self.camera_bp, self.transform, attach_to=self.vehicle)
@@ -78,7 +79,7 @@ class SyncVideoRecorder:
                 array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
                 array = np.reshape(array, (image.height, image.width, 4))
                 array = array[:, :, :3].copy()
-                cv2.putText(array, "FSM AutoPilot (Fixed)", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                cv2.putText(array, "FSM AutoPilot", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 writer.write(array)
             except queue.Empty: continue
         writer.release()
@@ -112,35 +113,65 @@ def check_lane_safety(target_lane_id, perception_data, ego_speed):
     for obj in perception_data['surrounding'][target_lane_id]:
         d = obj['rel_dist']
         rel_speed = obj['rel_speed']
-        if abs(d) < 10.0: return False # 盲区
-        if d > 0 and d < 15.0: return False # 前方太近
+        # 激进一点的安全距离，方便触发换道
+        if abs(d) < 8.0: return False # 盲区
+        if d > 0 and d < 12.0: return False # 前方太近
         if d < 0:
             if rel_speed > 5.0: 
                 ttc = abs(d) / (rel_speed / 3.6)
-                if ttc < 3.0: return False
-            if abs(d) < 15.0: return False
+                if ttc < 2.5: return False
+            if abs(d) < 12.0: return False
     return True
 
 # ============================
-# 3. 交通流生成
+# 3. 交通流生成 (任务三重点修改)
 # ============================
-def spawn_traffic(client, world, num_vehicles=30):
-    print(f"正在生成 {num_vehicles} 辆背景车辆...")
+def spawn_traffic(client, world, ego_spawn_transform, num_vehicles=40):
+    """
+    任务三修复：基于自车位置生成密集车流
+    """
+    print(f"正在自车附近生成 {num_vehicles} 辆背景车辆...")
     tm = client.get_trafficmanager()
     tm.set_global_distance_to_leading_vehicle(2.5)
     tm.set_synchronous_mode(True)
-    tm.set_random_device_seed(0)
+    tm.set_random_device_seed(int(time.time()))
     
     bp_lib = world.get_blueprint_library()
     vehicle_bps = bp_lib.filter('vehicle.*')
     vehicle_bps = [x for x in vehicle_bps if int(x.get_attribute('number_of_wheels')) == 4]
-    spawn_points = world.get_map().get_spawn_points()
+    
+    all_spawn_points = world.get_map().get_spawn_points()
+    
+    # === 空间过滤算法 ===
+    nearby_points = []
+    ego_loc = ego_spawn_transform.location
+    
+    for sp in all_spawn_points:
+        # 计算距离
+        dist = sp.location.distance(ego_loc)
+        
+        # 筛选逻辑：
+        # 1. 距离在 5米 到 300米之间 (太近会撞，太远没意义)
+        # 2. 尽量筛选同向车道 (简单判断：Yaw 角度差小于 90度)
+        if 5.0 < dist < 300.0:
+            ego_yaw = ego_spawn_transform.rotation.yaw
+            sp_yaw = sp.rotation.yaw
+            angle_diff = abs(ego_yaw - sp_yaw)
+            while angle_diff > 180: angle_diff -= 360
+            while angle_diff < -180: angle_diff += 360
+            
+            if abs(angle_diff) < 90: # 同向
+                nearby_points.append(sp)
+    
+    print(f"在范围内找到 {len(nearby_points)} 个可用生成点。")
+    random.shuffle(nearby_points)
     
     npc_list = []
-    random.shuffle(spawn_points)
+    # 如果点不够，就尽量生成，不超过 num_vehicles
+    count = min(num_vehicles, len(nearby_points))
 
-    for n, transform in enumerate(spawn_points):
-        if n >= num_vehicles: break
+    for i in range(count):
+        transform = nearby_points[i]
         bp = random.choice(vehicle_bps)
         if bp.has_attribute('color'):
             bp.set_attribute('color', random.choice(bp.get_attribute('color').recommended_values))
@@ -148,10 +179,15 @@ def spawn_traffic(client, world, num_vehicles=30):
             actor = world.try_spawn_actor(bp, transform)
             if actor:
                 actor.set_autopilot(True)
-                tm.vehicle_percentage_speed_difference(actor, random.choice([-20, -10, 0, 10, 20]))
+                # 让背景车辆速度慢一点 (-30% ~ -10%)，迫使自车换道
+                tm.vehicle_percentage_speed_difference(actor, random.uniform(10, 30))
+                # 忽略红绿灯和停车标志 (高速公路模式)
+                tm.ignore_lights_percentage(actor, 100)
+                tm.ignore_signs_percentage(actor, 100)
                 npc_list.append(actor)
         except: pass
     
+    print(f"成功生成 {len(npc_list)} 辆密集背景车。")
     return npc_list
 
 # ============================
@@ -183,9 +219,7 @@ def main():
     try:
         data_logger = DataLogger("simulation_data_final.csv")
         
-        # === 任务二：保持目前的自车生成点位置不变 ===
-        # 根据日志，原起点坐标为 X:-515.25, Y:240.96
-        # 我们遍历所有 SpawnPoints，找到最接近这个坐标的点
+        # === 任务二：保持生成点位置不变 ===
         print("正在定位目标生成点 (-515.25, 240.96)...")
         spawn_points = world.get_map().get_spawn_points()
         start_transform = None
@@ -198,13 +232,10 @@ def main():
                 min_dist = dist
                 start_transform = sp
         
-        # 如果找不到特别近的，就强制使用坐标生成（可能在半空中，需小心）
         if min_dist > 5.0:
             print("警告：未找到匹配的SpawnPoint，使用强制坐标。")
-            start_transform = carla.Transform(target_loc, carla.Rotation(yaw=0)) # Yaw需根据道路调整
-            # 修正 Yaw: 获取最近的路点朝向
             wp = world.get_map().get_waypoint(target_loc)
-            start_transform.rotation = wp.transform.rotation
+            start_transform = carla.Transform(target_loc, wp.transform.rotation)
             start_transform.location.z += 0.5
         else:
             print(f"找到匹配点，距离误差: {min_dist:.2f}米")
@@ -215,7 +246,8 @@ def main():
         
         for _ in range(20): world.tick()
 
-        npc_list = spawn_traffic(client, world, num_vehicles=50)
+        # === 任务三：传入 ego_transform 进行密集生成 ===
+        npc_list = spawn_traffic(client, world, start_transform, num_vehicles=40)
 
         perception = PerceptionModule(ego_vehicle, world)
         decision = FSMDecision(target_speed=95.0, safety_dist=20.0) 
@@ -224,8 +256,10 @@ def main():
         recorder = SyncVideoRecorder(ego_vehicle, world, fps=FPS)
         recorder.start()
         
-        print(f"\n=== 仿真开始: 修复切弯撞墙Bug版 ===")
-        print(f"修正策略: 缩短横向控制预瞄距离")
+        spectator = world.get_spectator()
+        
+        print(f"\n=== 仿真开始: 压线修正 & 视角跟随版 ===")
+        print(f"修正策略: 极短预瞄 + 密集车流 + 实时追尾视角")
         print("-" * 80)
 
         is_changing_lane = False; target_lane_id = None    
@@ -237,6 +271,17 @@ def main():
             world.tick()
             frame_count += 1
             
+            # === 任务二核心修复：视角每帧跟随 (Chase View) ===
+            # 获取自车当前的变换矩阵
+            ego_trans = ego_vehicle.get_transform()
+            # 计算摄像机位置：自车后方 8米，高度 3.5米
+            # 使用 get_forward_vector() 的反方向
+            camera_loc = ego_trans.location - 8.0 * ego_trans.get_forward_vector() + carla.Location(z=3.5)
+            # 摄像机朝向：与车头一致，但在 Pitch 上稍微向下俯视 (-10度)
+            camera_rot = ego_trans.rotation
+            camera_rot.pitch = -10.0 
+            spectator.set_transform(carla.Transform(camera_loc, camera_rot))
+
             # 里程统计
             current_location = ego_vehicle.get_location()
             total_distance += current_location.distance(last_location)
@@ -262,7 +307,7 @@ def main():
                     if left_wp and left_wp.lane_type == carla.LaneType.Driving:
                         if check_lane_safety(left_wp.lane_id, perception_data, ego_spd):
                              is_changing_lane = True; target_lane_id = left_wp.lane_id; decision.change_lane_cooldown = 100
-                    else: decision.current_state = State.KEEP_LANE # 物理不可达
+                    else: decision.current_state = State.KEEP_LANE 
 
                 elif target_state == State.LANE_CHANGE_RIGHT:
                     right_wp = ego_wp.get_right_lane()
@@ -277,22 +322,22 @@ def main():
                     decision.current_state = State.KEEP_LANE
                     print(f"    >>> 换道完成.")
 
-            # === 任务一核心修复：路径规划 (Lookahead) ===
-            # 之前是 ego_spd * 0.5 (90km/h时=45m)。这在内侧车道会导致切过护栏。
-            # 修复：大幅缩短横向控制的预瞄距离，强制车辆贴合当前弯道几何。
-            # 新逻辑：20km/h -> 6m, 90km/h -> 22m。
-            lookahead_dist = np.clip(ego_spd * 0.25, 6.0, 25.0)
+            # === 任务一核心修复：修正弯道压线 (解决 Chord Error) ===
+            # 旧逻辑: lookahead = ego_spd * 0.25 (90km/h -> 22m), 在弯道依然会切内线。
+            # 新逻辑: 强制将上限压低至 15m。
+            # 即使在 100km/h，也只看 15m。这会让方向盘响应更灵敏，从而紧贴车道线。
+            # 下限设为 4.5m 保证低速不抖动。
+            lookahead_dist = np.clip(ego_spd * 0.18, 4.5, 15.0)
             
             follow_wp = ego_wp
             if is_changing_lane and target_lane_id:
-                if target_lane_id == current_lane_id + 1: # OpenDRIVE negative IDs
+                if target_lane_id == current_lane_id + 1: 
                     maybe_left = ego_wp.get_left_lane()
                     if maybe_left: follow_wp = maybe_left
                 elif target_lane_id == current_lane_id - 1:
                     maybe_right = ego_wp.get_right_lane()
                     if maybe_right: follow_wp = maybe_right
             
-            # 获取预瞄点
             next_wps = follow_wp.next(lookahead_dist)
             aim_wp = next_wps[0] if next_wps else follow_wp
 
@@ -314,7 +359,6 @@ def main():
             control = controller.run_step(target_speed, aim_wp, emergency_stop=(target_speed==0))
             ego_vehicle.apply_control(control)
 
-            # 日志
             l_free = perception_data['lanes']['left_available']
             r_free = perception_data['lanes']['right_available']
             current_time = frame_count / FPS
@@ -329,7 +373,8 @@ def main():
             if frame_count % 10 == 0:
                 s_str = decision.current_state.name
                 if is_changing_lane: s_str = f"CHG -> {target_lane_id}"
-                print(f"\rTime:{current_time:5.1f}s | Spd:{ego_spd:4.1f} | Lookahead:{lookahead_dist:.1f}m | Dist:{min_obs_dist:4.1f}m | {s_str:<12} | Loc:({current_location.x:.0f},{current_location.y:.0f})", end="")
+                # 打印信息中增加 'Lane' 方便观察是否在切弯
+                print(f"\rTime:{current_time:5.1f}s | Spd:{ego_spd:4.1f} | Lookahead:{lookahead_dist:.1f}m | Obs:{min_obs_dist:4.1f}m | {s_str:<12} ", end="")
 
     finally:
         settings.synchronous_mode = False
