@@ -126,7 +126,7 @@ def check_lane_safety(target_lane_id, perception_data, ego_speed):
 # ============================
 # 3. 交通流生成 (任务三重点修改)
 # ============================
-def spawn_traffic(client, world, ego_spawn_transform, num_vehicles=40):
+def spawn_traffic(client, world, ego_spawn_transform, num_vehicles=100):
     """
     任务三修复：基于自车位置生成密集车流
     """
@@ -247,7 +247,7 @@ def main():
         for _ in range(20): world.tick()
 
         # === 任务三：传入 ego_transform 进行密集生成 ===
-        npc_list = spawn_traffic(client, world, start_transform, num_vehicles=40)
+        npc_list = spawn_traffic(client, world, start_transform, num_vehicles=400)
 
         perception = PerceptionModule(ego_vehicle, world)
         decision = FSMDecision(target_speed=95.0, safety_dist=20.0) 
