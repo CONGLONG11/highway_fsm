@@ -1,0 +1,96 @@
+# ============================================================
+#  Highway FSM 自动驾驶系统 - 全局配置文件
+# ============================================================
+
+# --- 场景配置 ---
+carla:
+  host: "localhost"
+  port: 2000
+  timeout: 10.0
+  map: "Town04"                # 高速公路地图
+  spawn_point_index: 50        # 出生点编号
+  num_npc: 30                  # NPC 车辆数量
+  npc_speed_range: [60, 100]   # NPC 速度范围 km/h
+
+# --- 自车配置 ---
+ego:
+  vehicle_model: "vehicle.tesla.model3"
+  target_speed: 100.0          # 目标速度 km/h
+  max_speed: 120.0             # 最大速度 km/h
+
+# --- 感知模块 ---
+perception:
+  detection_range: 100.0       # 检测范围 m
+  lane_check_dist: 5.0         # 车道检查前向距离 m
+
+# --- 模糊逻辑参数 (创新点1) ---
+fuzzy:
+  # 距离隶属度函数参数
+  dist_close_range: [0, 15, 25]       # 近: 三角形 [a, b, c]
+  dist_medium_range: [20, 35, 50]     # 中
+  dist_far_range: [45, 60, 100]       # 远
+  # 速度差隶属度函数参数
+  dv_negative_range: [-30, -15, 0]    # 减速中 (前车比我慢)
+  dv_zero_range: [-5, 0, 5]           # 速度相近
+  dv_positive_range: [0, 15, 30]      # 加速中 (前车比我快)
+  # 变道意愿输出
+  desire_threshold: 0.6               # 意愿度 > 0.6 才触发变道评估
+
+# --- 代价函数权重 ---
+cost:
+  w_efficiency: 10.0           # 速度损失权重
+  w_safety: 20.0               # 安全代价权重
+  w_comfort: 8.0               # 变道惩罚 (舒适)
+  w_lane_bias: 2.0             # 车道偏好 (偏好中间车道)
+
+# --- 人工势场参数 (创新点2) ---
+apf:
+  k_attract: 1.0               # 引力增益
+  k_repulse: 80.0              # 斥力增益
+  repulse_range: 25.0          # 斥力影响范围 m
+  repulse_safe_dist: 5.0       # 最小安全距离 m
+  field_resolution: 0.5        # 势场网格分辨率 m
+
+# --- 轨迹规划参数 ---
+planner:
+  lane_change_duration: 3.5    # 变道耗时 s
+  trajectory_dt: 0.05          # 轨迹采样间隔 s
+  apf_correction_gain: 0.3     # 势场修正增益
+  max_lateral_accel: 3.0       # 最大横向加速度 m/s^2
+
+# --- 自适应 Stanley 控制器参数 (创新点3) ---
+controller:
+  # 纵向 PID
+  lon_kp: 1.0
+  lon_ki: 0.05
+  lon_kd: 0.1
+  # 横向 Stanley
+  k_stanley_base: 0.5         # 基础增益
+  k_stanley_min: 0.2          # 高速最小增益
+  k_stanley_max: 1.5          # 低速最大增益
+  k_soft: 0.5                 # 软化系数
+  # 预瞄距离
+  lookahead_min: 3.0           # m
+  lookahead_max: 20.0          # m
+  lookahead_ratio: 0.25        # Ld = ratio * speed + min
+  # 转向滤波
+  steer_filter_alpha: 0.3     # 一阶低通滤波系数 (0~1, 越小越平滑)
+  # 限位
+  max_steer_high_speed: 0.25  # >80km/h 最大转角
+  max_steer_mid_speed: 0.45   # >50km/h 最大转角
+
+# --- 安全参数 ---
+safety:
+  min_front_dist: 15.0         # 前方最小安全距离 m
+  min_side_dist: 8.0           # 侧方最小安全距离 m
+  min_rear_dist: 12.0          # 后方最小安全距离 m
+  ttc_threshold: 3.0           # TTC 阈值 s
+  lane_change_cooldown: 150    # 变道冷却 (帧数)
+
+# --- 可视化 ---
+visualization:
+  enabled: true
+  draw_trajectory: true
+  draw_risk_field: false       # 势场可视化 (开销大)
+  draw_waypoints: true
+  hud_enabled: true
