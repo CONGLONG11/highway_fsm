@@ -39,6 +39,74 @@ def load_config():
     return {}
 
 # ==============================================================
+#              天气设置（解决问题②）
+# ==============================================================
+def set_clear_weather(world):
+    """设置晴朗天气"""
+    weather = carla.WeatherParameters(
+        cloudiness=10.0,
+        precipitation=0.0,
+        precipitation_deposits=0.0,
+        wind_intensity=5.0,
+        sun_azimuth_angle=45.0,
+        sun_altitude_angle=70.0,    # 太阳高度角，70度≈正午偏早
+        fog_density=0.0,
+        fog_distance=0.0,
+        wetness=0.0,
+    )
+    world.set_weather(weather)
+    print("[Weather] 已设置为晴朗天气 ☀️")
+
+# ==============================================================
+#             NPC 速度差异化（解决问题③ 辅助）
+# ==============================================================
+def configure_npc_traffic(npc_vehicles, client):
+    """
+    让 NPC 速度差异化：部分慢车、部分快车。
+    这样自车更容易遇到前方慢车，触发换道。
+    
+    参数：
+        npc_vehicles : list of carla.Actor
+        client : carla.Client （用于获取 TrafficManager）
+    """
+    import random
+    
+    try:
+        tm = client.get_trafficmanager()
+        tm.set_global_distance_to_leading_vehicle(2.5)
+
+        for i, npc in enumerate(npc_vehicles):
+            if npc is None or not npc.is_alive:
+                continue
+            npc.set_autopilot(True, tm.get_port())
+
+            # 30% 的车设为慢车（限速的60-75%），增加换道机会
+            # 40% 正常速度
+            # 30% 略快
+            r = random.random()
+            if r < 0.30:
+                # 慢车：percentage 为正值 → 比限速慢
+                tm.vehicle_percentage_speed_difference(npc, random.uniform(25.0, 40.0))
+            elif r < 0.70:
+                # 正常
+                tm.vehicle_percentage_speed_difference(npc, random.uniform(0.0, 15.0))
+            else:
+                # 快车：percentage 为负值 → 比限速快
+                tm.vehicle_percentage_speed_difference(npc, random.uniform(-15.0, -5.0))
+
+            # 随机换道行为，让交通更自然
+            tm.random_left_lanechange_percentage(npc, 30)
+            tm.random_right_lanechange_percentage(npc, 30)
+            tm.auto_lane_change(npc, True)
+
+        print(f"[Traffic] 已配置 {len(npc_vehicles)} 辆 NPC 差异化速度")
+    except Exception as e:
+        print(f"[Traffic] TrafficManager 配置失败: {e}，使用默认 autopilot")
+        for npc in npc_vehicles:
+            if npc is not None and npc.is_alive:
+                npc.set_autopilot(True)
+
+# ==============================================================
 #             感知数据转换（关键适配层）
 # ==============================================================
 def convert_surrounding_to_offsets(surrounding_by_lane_id, ego_lane_id,
@@ -46,9 +114,6 @@ def convert_surrounding_to_offsets(surrounding_by_lane_id, ego_lane_id,
     """
     将 perception.py 输出的按真实 lane_id 分组的 surrounding
     转换为 fsm_decision.py 期望的按偏移量分组的格式。
-
-    perception 输出:  { lane_id: [vehicles] }
-    fsm 期望:         { 0: [...], -1: [...], +1: [...] }
     """
     offset_surr = {0: [], -1: [], 1: []}
 
@@ -59,7 +124,6 @@ def convert_surrounding_to_offsets(surrounding_by_lane_id, ego_lane_id,
     right_lane_id = right_wp.lane_id if right_wp else None
 
     for lane_id, vehicles in surrounding_by_lane_id.items():
-        # 补充 'actor_id' 字段（entropy 模块需要）
         for v in vehicles:
             if 'actor_id' not in v:
                 v['actor_id'] = v.get('id', 0)
@@ -114,19 +178,13 @@ def collect_obstacles(offset_surrounding):
     return obstacles
 
 def _update_spectator(spectator, ego_vehicle):
-    """
-    让 CARLA 观察者摄像机跟随自车。
-    
-    视角：第三人称，自车正后方偏上，俯视前方。
-    类似于赛车游戏的追尾视角。
-    """
+    """第三人称追尾视角"""
     tf = ego_vehicle.get_transform()
     yaw_rad = math.radians(tf.rotation.yaw)
 
-    # ---- 视角参数（可调）----
-    offset_back = 12.0   # 后方距离 (m)
-    offset_up = 8.0      # 上方高度 (m)
-    pitch = -20.0        # 俯视角度 (度)
+    offset_back = 12.0
+    offset_up = 8.0
+    pitch = -20.0
 
     cam_x = tf.location.x - offset_back * math.cos(yaw_rad)
     cam_y = tf.location.y - offset_back * math.sin(yaw_rad)
@@ -149,6 +207,30 @@ def main():
     # ============================================
     world, ego_vehicle, npc_vehicles = setup_carla(config)
 
+    # 获取 client 对象用于 TrafficManager
+    try:
+        client = carla.Client('localhost', 2000)
+        client.set_timeout(10.0)
+    except Exception as e:
+        print(f"[Main] 无法连接 CARLA client: {e}")
+        client = None
+
+    # ============================================
+    # 设置晴朗天气（问题②）
+    # ============================================
+    set_clear_weather(world)
+
+    # ============================================
+    # 配置 NPC 差异化速度（问题③ 辅助）
+    # ============================================
+    if client:
+        configure_npc_traffic(npc_vehicles, client)
+    else:
+        print("[Traffic] 跳过 TrafficManager 配置")
+        for npc in npc_vehicles:
+            if npc is not None and npc.is_alive:
+                npc.set_autopilot(True)
+
     # ============================================
     # 初始化各模块
     # ============================================
@@ -167,12 +249,18 @@ def main():
     # 变道轨迹缓存
     active_trajectory = None
 
-    # 观察者摄像机（跟随自车）
+    # 观察者摄像机
     spectator = world.get_spectator()
+
+    # 统计
+    lane_change_count = 0
+    last_state = State.KEEP_LANE
 
     print("=" * 60)
     print("  Highway FSM 自动驾驶系统启动")
     print("  创新: 曲率调速 | 信息熵 | 反事实 | 相空间 | 多预瞄")
+    print("  天气: 晴朗 ☀️  | NPC: {} 辆 (差异化速度)".format(
+        len(npc_vehicles)))
     print("  按 Ctrl+C 停止")
     print("=" * 60)
 
@@ -184,7 +272,7 @@ def main():
             world.tick()
             frame_count += 1
 
-            # ---- 更新观察者视角（跟随自车）----
+            # ---- 更新观察者视角 ----
             _update_spectator(spectator, ego_vehicle)
 
             # ============================================
@@ -200,7 +288,6 @@ def main():
             current_wp = ego_data['waypoint']
             ego_lane_id = ego_data['lane_id']
 
-            # 格式转换
             surrounding = convert_surrounding_to_offsets(
                 raw_surrounding, ego_lane_id, lanes_info
             )
@@ -218,6 +305,18 @@ def main():
             decision = fsm.update(ego_data, surrounding)
             state = decision['state']
             target_lane_id = decision['target_lane_id']
+
+            # 统计换道次数
+            if (state in (State.CHANGE_LEFT, State.CHANGE_RIGHT) and
+                    last_state not in (State.CHANGE_LEFT, State.CHANGE_RIGHT)):
+                lane_change_count += 1
+                direction_str = "← 左" if state == State.CHANGE_LEFT else "右 →"
+                print(f"\n{'='*40}")
+                print(f"  🚗 第 {lane_change_count} 次换道: {direction_str}")
+                print(f"  速度={current_speed:.1f} km/h  "
+                      f"意愿={fsm.debug_info['desire_effective']:.2f}")
+                print(f"{'='*40}\n")
+            last_state = state
 
             # ============================================
             # 4. 规划
@@ -285,7 +384,7 @@ def main():
                                 follow_speed)
 
             if state in (State.CHANGE_LEFT, State.CHANGE_RIGHT):
-                control_speed = min(control_speed, 85.0)
+                control_speed = min(control_speed, 90.0)  # 换道限速略提高
 
             # ============================================
             # 6. 控制
@@ -308,7 +407,8 @@ def main():
                 gov = speed_governor.debug
                 ctrl = controller.debug
                 di = fsm.debug_info
-                traj_str = f"{len(trajectory)}pts" if trajectory else "None"
+                traj_str = (f"{len(trajectory)}pts"
+                            if trajectory else "None")
 
                 front_str = (f"d={front['rel_dist']:.1f}m "
                              f"v={front['speed']:.1f}"
@@ -323,11 +423,12 @@ def main():
                     f"H={di.get('entropy', 0):.2f} | "
                     f"CTE={ctrl['cte']:+.2f} | "
                     f"Front=[{front_str}] | "
-                    f"Traj={traj_str}"
+                    f"Traj={traj_str} | "
+                    f"LC={lane_change_count}"
                 )
 
     except KeyboardInterrupt:
-        print("\n[Main] 用户中断，正在清理...")
+        print(f"\n[Main] 用户中断 | 总换道次数: {lane_change_count}")
     except Exception as e:
         print(f"\n[Main] 运行异常: {e}")
         traceback.print_exc()
@@ -338,3 +439,4 @@ def main():
 # ==============================================================
 if __name__ == '__main__':
     main()
+

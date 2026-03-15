@@ -2,15 +2,17 @@
 curvature_speed_governor.py — 曲率积分能量速度调控器（构想①）
 
 核心思想：
-  不在弯道当前点才减速（已来不及），而是沿前方道路计算
+  不在弯道当前点才减速，而是沿前方道路计算
   一段曲率能量积分，提前感知未来路段的弯曲程度，
   在进入弯道前就开始平滑减速。
 
   E_κ = ∫₀^Lf κ(s)² ds
-
   v_max = v_target / (1 + α·E_κ)
 
-直接解决：自车100km/h进弯冲出车道的致命BUG
+优化改进：
+  - alpha 从配置读取（高速公路弯道平缓，不需要激进减速）
+  - 非对称滤波参数可配置（加速恢复更快）
+  - min_speed 提高到适合高速公路的水平
 """
 
 import math
@@ -25,18 +27,18 @@ class CurvatureSpeedGovernor:
     2. 三点法计算每个采样点的局部曲率 κ
     3. 曲率能量积分 E = Σκ²·Δs
     4. 根据 E 和最大曲率计算安全速度上限
-    5. 低通滤波平滑输出（减速早、加速慢）
+    5. 低通滤波平滑输出（减速快、加速慢但不过慢）
     """
 
     def __init__(self, config=None):
         cfg = config or {}
-        self.lookahead_distance = cfg.get('lookahead_distance', 150.0)
+        self.lookahead_distance = cfg.get('lookahead_distance', 100.0)
         self.sample_spacing = cfg.get('sample_spacing', 3.0)
-        self.alpha = cfg.get('alpha', 600.0)
-        self.a_lat_max = cfg.get('a_lat_max', 3.0)
-        self.min_speed = cfg.get('min_speed', 30.0)
-        self.filter_alpha_down = cfg.get('filter_alpha_down', 0.06)
-        self.filter_alpha_up = cfg.get('filter_alpha_up', 0.15)
+        self.alpha = cfg.get('alpha', 150.0)
+        self.a_lat_max = cfg.get('a_lat_max', 4.5)
+        self.min_speed = cfg.get('min_speed', 60.0)
+        self.filter_alpha_down = cfg.get('filter_alpha_down', 0.10)
+        self.filter_alpha_up = cfg.get('filter_alpha_up', 0.35)
         self._prev_output = None
 
         self.debug = {
@@ -66,7 +68,7 @@ class CurvatureSpeedGovernor:
         self.debug['n_samples'] = len(points)
 
         if len(points) < 3:
-            return self._apply_filter(target_speed_kmh * 0.6)
+            return self._apply_filter(target_speed_kmh * 0.8)
 
         # ---- 2. 局部曲率计算 ----
         curvatures = self._compute_curvatures(points)
@@ -91,7 +93,7 @@ class CurvatureSpeedGovernor:
             point_speed = target_speed_kmh
         self.debug['point_speed_limit'] = round(point_speed, 1)
 
-        # ---- 5. 取最保守值 ----
+        # ---- 5. 取最保守值，但不低于 min_speed ----
         safe_speed = min(energy_speed, point_speed, target_speed_kmh)
         safe_speed = max(safe_speed, self.min_speed)
         self.debug['final_speed_limit'] = round(safe_speed, 1)
@@ -124,20 +126,26 @@ class CurvatureSpeedGovernor:
             C = np.array(points[i + 1])
             AB, AC, BC = B - A, C - A, C - B
             cross = abs(AB[0] * AC[1] - AB[1] * AC[0])
-            ab, bc, ac = np.linalg.norm(AB), np.linalg.norm(BC), np.linalg.norm(AC)
+            ab = np.linalg.norm(AB)
+            bc = np.linalg.norm(BC)
+            ac = np.linalg.norm(AC)
             denom = ab * bc * ac
             curvatures.append(2.0 * cross / denom if denom > 1e-10 else 0.0)
         return curvatures
 
     def _apply_filter(self, value):
-        """非对称低通：减速快响应（α小），加速慢响应（α大）"""
+        """非对称低通：减速响应较快，加速恢复适中"""
         if self._prev_output is None:
             self._prev_output = value
             return value
-        alpha = self.filter_alpha_down if value < self._prev_output else self.filter_alpha_up
+        if value < self._prev_output:
+            alpha = self.filter_alpha_down  # 减速
+        else:
+            alpha = self.filter_alpha_up    # 加速恢复
         out = alpha * value + (1.0 - alpha) * self._prev_output
         self._prev_output = out
         return out
 
     def reset(self):
         self._prev_output = None
+

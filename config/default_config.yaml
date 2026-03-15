@@ -7,13 +7,13 @@ carla:
   host: 'localhost'
   port: 2000
   timeout: 10.0
-  map: 'Town04'
+  map: 'Town06'
   sync_mode: true
   delta_seconds: 0.05
 
 # ---- 场景 ----
-spawn_point_index: 50
-num_npc: 30
+spawn_point_index: 0
+num_npc: 80                # ③ 30→80，大幅增加车流密度
 target_speed: 100.0        # km/h
 
 # ---- 感知 ----
@@ -22,12 +22,12 @@ perception:
 
 # ---- 决策 ----
 decision:
-  desire_threshold: 0.55
-  prep_duration: 1.0
+  desire_threshold: 0.35   # ③ 0.55→0.35，降低换道触发门槛
+  prep_duration: 0.8       # ③ 1.0→0.8，缩短准备时间
   abort_duration: 1.5
   lane_change_timeout: 6.0
-  safe_front_dist: 15.0
-  safe_rear_dist: 12.0
+  safe_front_dist: 12.0    # ③ 15→12，适当放宽前方安全距离
+  safe_rear_dist: 10.0     # ③ 12→10，适当放宽后方安全距离
   use_entropy: true
   use_counterfactual: true
   use_phase_space: true
@@ -35,9 +35,9 @@ decision:
 # ---- 模糊推理 ----
 fuzzy:
   front_distance:
-    close:  [0, 0, 15, 30]
-    medium: [20, 35, 50, 65]
-    far:    [50, 70, 100, 100]
+    close:  [0, 0, 20, 35]     # ③ 扩大"近"的范围，更容易判定前车近
+    medium: [25, 40, 55, 70]
+    far:    [60, 80, 100, 100]
   speed_diff:
     negative: [-30, -30, -10, 0]
     zero:     [-5, 0, 0, 5]
@@ -77,16 +77,13 @@ controller:
 
 # ---- 曲率速度调控（构想①）----
 curvature_governor:
-  a_lat_max: 3.5
-  lookahead_distance: 120.0
+  a_lat_max: 4.5             # ① 3.0→4.5，允许更大侧向加速度（高速公路弯道本身缓）
+  lookahead_distance: 100.0  # ① 150→100，前瞻缩短，避免过早减速
   sample_spacing: 3.0
-  integral_decay: 0.85
-  integral_weight: 0.6
-  point_weight: 0.4
-  speed_margin: 5.0
-  min_speed: 30.0
-  max_speed: 120.0
-  smoothing_rate: 3.0
+  alpha: 150.0               # ① 600→150，大幅降低曲率能量惩罚系数
+  min_speed: 60.0            # ① 30→60，高速公路最低速度提高
+  filter_alpha_down: 0.10    # ① 0.06→0.10，减速响应稍加快
+  filter_alpha_up: 0.35      # ① 0.15→0.35，加速恢复显著加快
 
 # ---- 信息熵（构想③）----
 entropy:
@@ -109,8 +106,9 @@ counterfactual:
 
 # ---- 相空间安全（构想②）----
 phase_space:
-  reaction_time: 1.2
+  reaction_time: 1.0         # ③ 1.2→1.0，适当降低，避免过于保守
   max_decel: 5.0
   comfort_decel: 3.0
-  safety_margin: 2.0
-  ttc_threshold: 3.0
+  safety_margin: 1.5         # ③ 2.0→1.5
+  ttc_threshold: 2.5         # ③ 3.0→2.5
+
