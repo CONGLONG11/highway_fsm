@@ -34,7 +34,8 @@ def load_config(config_path='../config/config.yaml'):
 def setup_carla(config):
     """连接 CARLA 并初始化世界"""
     carla_cfg = config.get('carla', {})
-    host = carla_cfg.get('host', 'localhost')
+    # host = carla_cfg.get('host', 'localhost')
+    host = '127.0.0.1'
     port = carla_cfg.get('port', 2000)
     timeout = carla_cfg.get('timeout', 10.0)
 
