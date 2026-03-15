@@ -1,160 +1,178 @@
 """
-Highway FSM 自动驾驶系统 - 主入口
-=====================================
-整合所有模块的主控制循环
+main.py — Highway FSM 自动驾驶系统主程序
+================================================
 """
-import carla
-import yaml
-import time
-import random
+
 import sys
 import os
+import time
 import math
 import traceback
 
-# 将 src 目录添加到路径
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import carla
+import numpy as np
 
+# ---- 项目模块 ----
+from setup import setup_carla, cleanup
 from perception import PerceptionModule
 from fsm_decision import FSMDecision, State
-from planner import MotionPlanner
-from controller import AdaptiveStanleyController
-from visualization import Visualizer
+from fuzzy_engine import FuzzyLaneChangeEngine
+from trajectory_planner import LaneChangeTrajectoryPlanner
+from risk_field import RiskFieldCorrector
+from controller import VehicleController
+from curvature_speed_governor import CurvatureSpeedGovernor
 
-def load_config(config_path='../config/config.yaml'):
-    """加载配置文件"""
-    abs_path = os.path.join(os.path.dirname(__file__), config_path)
-    if os.path.exists(abs_path):
-        with open(abs_path, 'r', encoding='utf-8') as f:
-            return yaml.safe_load(f)
-    else:
-        print(f"[Warning] Config file not found: {abs_path}, using defaults")
-        return {}
+import yaml
 
-def setup_carla(config):
-    """连接 CARLA 并初始化世界"""
-    carla_cfg = config.get('carla', {})
-    # host = carla_cfg.get('host', 'localhost')
-    host = '127.0.0.1'
-    port = carla_cfg.get('port', 2000)
-    timeout = carla_cfg.get('timeout', 10.0)
+def load_config():
+    """加载 YAML 配置文件"""
+    config_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'config', 'default_config.yaml'
+    )
+    if os.path.exists(config_path):
+        with open(config_path, 'r', encoding='utf-8') as f:
+            cfg = yaml.safe_load(f)
+            print(f"[Config] 已加载配置文件: {config_path}")
+            return cfg
+    print(f"[Config] 未找到 {config_path}，使用默认参数")
+    return {}
 
-    client = carla.Client(host, port)
-    client.set_timeout(timeout)
+# ==============================================================
+#             感知数据转换（关键适配层）
+# ==============================================================
+def convert_surrounding_to_offsets(surrounding_by_lane_id, ego_lane_id,
+                                   lanes_info):
+    """
+    将 perception.py 输出的按真实 lane_id 分组的 surrounding
+    转换为 fsm_decision.py 期望的按偏移量分组的格式。
 
-    # 加载地图
-    map_name = carla_cfg.get('map', 'Town04')
-    world = client.load_world(map_name)
+    perception 输出:  { lane_id: [vehicles] }
+    fsm 期望:         { 0: [...], -1: [...], +1: [...] }
+    """
+    offset_surr = {0: [], -1: [], 1: []}
 
-    # 设置同步模式
-    settings = world.get_settings()
-    settings.synchronous_mode = True
-    settings.fixed_delta_seconds = 0.05  # 20 FPS
-    world.apply_settings(settings)
+    left_wp = lanes_info.get('left_wp')
+    right_wp = lanes_info.get('right_wp')
 
-    # 设置天气 (白天晴天，论文截图好看)
-    weather = carla.WeatherParameters.ClearNoon
-    world.set_weather(weather)
+    left_lane_id = left_wp.lane_id if left_wp else None
+    right_lane_id = right_wp.lane_id if right_wp else None
 
-    return client, world
+    for lane_id, vehicles in surrounding_by_lane_id.items():
+        # 补充 'actor_id' 字段（entropy 模块需要）
+        for v in vehicles:
+            if 'actor_id' not in v:
+                v['actor_id'] = v.get('id', 0)
 
-def spawn_ego_vehicle(world, config):
-    """生成自车"""
-    ego_cfg = config.get('ego', {})
-    model = ego_cfg.get('vehicle_model', 'vehicle.tesla.model3')
-
-    bp_lib = world.get_blueprint_library()
-    vehicle_bp = bp_lib.find(model)
-    vehicle_bp.set_attribute('role_name', 'hero')
-
-    # 选择出生点
-    spawn_points = world.get_map().get_spawn_points()
-    spawn_idx = config.get('carla', {}).get('spawn_point_index', 50)
-    spawn_idx = min(spawn_idx, len(spawn_points) - 1)
-
-    ego = world.spawn_actor(vehicle_bp, spawn_points[spawn_idx])
-    print(f"[Setup] 自车已生成: {model} at spawn point {spawn_idx}")
-    return ego
-
-def spawn_npc_vehicles(world, config):
-    """生成 NPC 交通车辆"""
-    carla_cfg = config.get('carla', {})
-    num_npc = carla_cfg.get('num_npc', 30)
-
-    bp_lib = world.get_blueprint_library()
-    vehicle_bps = bp_lib.filter('vehicle.*')
-    spawn_points = world.get_map().get_spawn_points()
-
-    npcs = []
-    random.shuffle(spawn_points)
-
-    for i in range(min(num_npc, len(spawn_points) - 1)):
-        bp = random.choice(vehicle_bps)
-        try:
-            npc = world.spawn_actor(bp, spawn_points[i + 1])
-            npc.set_autopilot(True)
-            npcs.append(npc)
-        except Exception:
+        if lane_id == ego_lane_id:
+            offset = 0
+        elif left_lane_id is not None and lane_id == left_lane_id:
+            offset = -1
+        elif right_lane_id is not None and lane_id == right_lane_id:
+            offset = 1
+        else:
             continue
 
-    print(f"[Setup] 已生成 {len(npcs)} 辆 NPC 车辆")
-    return npcs
+        offset_surr[offset].extend(vehicles)
 
-def setup_spectator(world, vehicle):
-    """设置俯视观察视角"""
-    spectator = world.get_spectator()
-    transform = vehicle.get_transform()
+    for offset in offset_surr:
+        offset_surr[offset].sort(key=lambda v: v['rel_dist'])
+
+    return offset_surr
+
+def generate_waypoint_trajectory(waypoint, distance=150.0, spacing=2.0):
+    """从当前 waypoint 向前采样轨迹"""
+    transforms = []
+    wp = waypoint
+    total = 0.0
+    while total < distance:
+        transforms.append(wp.transform)
+        nxt = wp.next(spacing)
+        if not nxt:
+            break
+        wp = nxt[0]
+        total += spacing
+    return transforms
+
+def get_front_vehicle(offset_surrounding):
+    """获取当前车道最近前车"""
+    vehs = offset_surrounding.get(0, [])
+    fronts = [v for v in vehs if v['rel_dist'] > 2.0]
+    return min(fronts, key=lambda v: v['rel_dist']) if fronts else None
+
+def collect_obstacles(offset_surrounding):
+    """收集所有周围车辆作为势场障碍物"""
+    obstacles = []
+    for lane_vehs in offset_surrounding.values():
+        for v in lane_vehs:
+            if 'location' in v and 'velocity' in v:
+                obstacles.append({
+                    'location': v['location'],
+                    'velocity': v['velocity'],
+                    'speed': v['speed'],
+                })
+    return obstacles
+
+def _update_spectator(spectator, ego_vehicle):
+    """
+    让 CARLA 观察者摄像机跟随自车。
+    
+    视角：第三人称，自车正后方偏上，俯视前方。
+    类似于赛车游戏的追尾视角。
+    """
+    tf = ego_vehicle.get_transform()
+    yaw_rad = math.radians(tf.rotation.yaw)
+
+    # ---- 视角参数（可调）----
+    offset_back = 12.0   # 后方距离 (m)
+    offset_up = 8.0      # 上方高度 (m)
+    pitch = -20.0        # 俯视角度 (度)
+
+    cam_x = tf.location.x - offset_back * math.cos(yaw_rad)
+    cam_y = tf.location.y - offset_back * math.sin(yaw_rad)
+    cam_z = tf.location.z + offset_up
+
     spectator.set_transform(carla.Transform(
-        transform.location + carla.Location(z=50),
-        carla.Rotation(pitch=-90)
+        carla.Location(x=cam_x, y=cam_y, z=cam_z),
+        carla.Rotation(pitch=pitch, yaw=tf.rotation.yaw, roll=0.0)
     ))
 
-def update_spectator(world, vehicle):
-    """跟随自车更新观察视角"""
-    spectator = world.get_spectator()
-    transform = vehicle.get_transform()
-
-    # 第三人称跟随视角
-    forward = transform.get_forward_vector()
-    spectator.set_transform(carla.Transform(
-        transform.location + carla.Location(
-            x=-10 * forward.x,
-            y=-10 * forward.y,
-            z=8
-        ),
-        carla.Rotation(pitch=-20, yaw=transform.rotation.yaw)
-    ))
-
+# ==============================================================
+#                         主函数
+# ==============================================================
 def main():
-    """主函数"""
-    # ============================================================
-    # 初始化
-    # ============================================================
     config = load_config()
+    target_speed = config.get('target_speed', 100.0)
 
-    client, world = setup_carla(config)
-    ego_vehicle = spawn_ego_vehicle(world, config)
-    npc_vehicles = spawn_npc_vehicles(world, config)
+    # ============================================
+    # 初始化 CARLA
+    # ============================================
+    world, ego_vehicle, npc_vehicles = setup_carla(config)
 
-    # Tick 一次让所有车辆就位
-    world.tick()
-    time.sleep(1.0)
-
+    # ============================================
     # 初始化各模块
+    # ============================================
     perception = PerceptionModule(ego_vehicle, config.get('perception', {}))
-    decision = FSMDecision(config)
-    planner = MotionPlanner(ego_vehicle, config)
-    controller = AdaptiveStanleyController(ego_vehicle, config)
-    visualizer = Visualizer(world, config)
 
-    target_speed = config.get('ego', {}).get('target_speed', 100.0)
+    fsm = FSMDecision(config)
+    fuzzy = FuzzyLaneChangeEngine(config)
+    fsm.set_fuzzy_engine(fuzzy)
 
-    # 轨迹状态
-    active_trajectory = []   # 当前正在执行的轨迹
-    trajectory_index = 0     # 轨迹进度
+    planner = LaneChangeTrajectoryPlanner(config)
+    risk_field = RiskFieldCorrector(config)
+    controller = VehicleController(ego_vehicle, config)
+    speed_governor = CurvatureSpeedGovernor(
+        config.get('curvature_governor', {}))
+
+    # 变道轨迹缓存
+    active_trajectory = None
+
+    # 观察者摄像机（跟随自车）
+    spectator = world.get_spectator()
 
     print("=" * 60)
     print("  Highway FSM 自动驾驶系统启动")
+    print("  创新: 曲率调速 | 信息熵 | 反事实 | 相空间 | 多预瞄")
     print("  按 Ctrl+C 停止")
     print("=" * 60)
 
@@ -162,188 +180,161 @@ def main():
 
     try:
         while True:
-            # ============================================================
-            # Step 0: 仿真前进
-            # ============================================================
+            # ---- Tick ----
             world.tick()
             frame_count += 1
 
-            # ============================================================
-            # Step 1: 感知
-            # ============================================================
-            percept_data = perception.update()
-            ego_data = percept_data['ego']
-            surrounding = percept_data['surrounding']
-            lanes = percept_data['lanes']
+            # ---- 更新观察者视角（跟随自车）----
+            _update_spectator(spectator, ego_vehicle)
 
-            # ============================================================
-            # Step 2: 决策
-            # ============================================================
-            state = decision.decide(percept_data)
+            # ============================================
+            # 1. 感知
+            # ============================================
+            perception_data = perception.update()
 
-            # ============================================================
-            # Step 3: 规划
-            # ============================================================
+            ego_data = perception_data['ego']
+            raw_surrounding = perception_data['surrounding']
+            lanes_info = perception_data['lanes']
 
-            # 准备变道 → 生成轨迹
-            if state == State.PREPARE_LANE_CHANGE_LEFT and not active_trajectory:
-                if lanes['left_wp'] is not None:
-                    obstacles = perception.get_obstacles_for_planner(surrounding)
-                    active_trajectory = planner.generate_lane_change_trajectory(
-                        start_wp=ego_data['waypoint'],
-                        target_wp=lanes['left_wp'],
-                        ego_speed=ego_data['speed'],
-                        obstacles=obstacles
-                    )
-                    if active_trajectory:
-                        decision.notify_lane_change_start()
-                        print(f"[Planner] 左变道轨迹已生成: {len(active_trajectory)} 点")
-                    else:
-                        decision.notify_lane_change_complete()
+            current_speed = ego_data['speed']
+            current_wp = ego_data['waypoint']
+            ego_lane_id = ego_data['lane_id']
 
-            elif state == State.PREPARE_LANE_CHANGE_RIGHT and not active_trajectory:
-                if lanes['right_wp'] is not None:
-                    obstacles = perception.get_obstacles_for_planner(surrounding)
-                    active_trajectory = planner.generate_lane_change_trajectory(
-                        start_wp=ego_data['waypoint'],
-                        target_wp=lanes['right_wp'],
-                        ego_speed=ego_data['speed'],
-                        obstacles=obstacles
-                    )
-                    if active_trajectory:
-                        decision.notify_lane_change_start()
-                        print(f"[Planner] 右变道轨迹已生成: {len(active_trajectory)} 点")
-                    else:
-                        decision.notify_lane_change_complete()
-
-            # 车道保持时生成参考轨迹
-            elif state == State.KEEP_LANE and not active_trajectory:
-                keep_traj = planner.generate_keep_lane_trajectory(
-                    ego_data['waypoint'], length=40.0
-                )
-                # 车道保持轨迹不存入 active_trajectory (每帧刷新)
-                pass
-
-            # ============================================================
-            # Step 4: 轨迹完成检查
-            # ============================================================
-            if active_trajectory:
-                # 检查是否到达轨迹终点
-                ego_loc = ego_data['location']
-                end_loc = active_trajectory[-1].location
-                dist_to_end = ego_loc.distance(end_loc)
-
-                if dist_to_end < 3.0:
-                    print("[Planner] 轨迹执行完毕")
-                    active_trajectory = []
-                    decision.notify_lane_change_complete()
-
-            # ============================================================
-            # Step 5: 控制
-            # ============================================================
-
-            # 计算目标速度 (跟车时需减速)
-            current_lane = ego_data['lane_id']
-            front = perception.get_front_vehicle(current_lane, surrounding)
-            control_speed = target_speed
-
-            if front is not None:
-                fd = front['rel_dist']
-                if fd < 40.0:
-                    # 线性减速
-                    ratio = max(0.3, fd / 40.0)
-                    control_speed = min(target_speed, front['speed'] + 5.0)
-                    control_speed = max(control_speed, 30.0)
-
-            # 紧急制动判断
-            emergency = False
-            if front is not None and front['rel_dist'] < 8.0:
-                emergency = True
-
-            # 选择控制输入
-            if active_trajectory:
-                control = controller.run_step(
-                    control_speed, trajectory=active_trajectory,
-                    emergency_stop=emergency
-                )
-            else:
-                # 车道保持: 使用地图路点
-                keep_traj = planner.generate_keep_lane_trajectory(
-                    ego_data['waypoint'], length=40.0
-                )
-                control = controller.run_step(
-                    control_speed, trajectory=keep_traj,
-                    emergency_stop=emergency
-                )
-
-            ego_vehicle.apply_control(control)
-
-            # ============================================================
-            # Step 6: 可视化
-            # ============================================================
-            if active_trajectory:
-                visualizer.draw_trajectory(
-                    active_trajectory,
-                    color=carla.Color(0, 255, 0),
-                    life_time=0.15
-                )
-
-            visualizer.draw_vehicle_state(
-                ego_vehicle, decision.state, decision.debug_info
+            # 格式转换
+            surrounding = convert_surrounding_to_offsets(
+                raw_surrounding, ego_lane_id, lanes_info
             )
 
-            # 更新观察视角
-            if frame_count % 5 == 0:
-                update_spectator(world, ego_vehicle)
+            # ============================================
+            # 2. 曲率积分速度调控（构想①）
+            # ============================================
+            curvature_safe_speed = speed_governor.compute_safe_speed(
+                current_wp, target_speed, current_speed
+            )
 
-            # 打印状态 (每秒一次)
+            # ============================================
+            # 3. 决策（FSM + 模糊 + 熵 + 反事实 + 相空间）
+            # ============================================
+            decision = fsm.update(ego_data, surrounding)
+            state = decision['state']
+            target_lane_id = decision['target_lane_id']
+
+            # ============================================
+            # 4. 规划
+            # ============================================
+            trajectory = None
+
+            if state in (State.CHANGE_LEFT, State.CHANGE_RIGHT):
+                if active_trajectory is None:
+                    direction = -1 if state == State.CHANGE_LEFT else 1
+                    target_wp = (lanes_info.get('left_wp')
+                                 if direction == -1
+                                 else lanes_info.get('right_wp'))
+
+                    if target_wp is not None:
+                        try:
+                            raw_traj = planner.plan(
+                                ego_data['transform'],
+                                current_speed,
+                                target_wp,
+                            )
+                            obstacles = collect_obstacles(surrounding)
+                            if obstacles and raw_traj:
+                                try:
+                                    active_trajectory = risk_field.correct(
+                                        raw_traj, obstacles,
+                                        ego_data['transform'],
+                                        current_speed
+                                    )
+                                except Exception:
+                                    active_trajectory = raw_traj
+                            else:
+                                active_trajectory = raw_traj
+                        except Exception as e:
+                            print(f"[Planner] 轨迹规划失败: {e}")
+                            active_trajectory = None
+
+                trajectory = active_trajectory
+
+            elif state in (State.KEEP_LANE, State.PREP_LEFT, State.PREP_RIGHT):
+                active_trajectory = None
+                trajectory = generate_waypoint_trajectory(
+                    current_wp, distance=150.0, spacing=2.0
+                )
+
+            elif state == State.ABORT:
+                active_trajectory = None
+                trajectory = generate_waypoint_trajectory(
+                    current_wp, distance=100.0, spacing=2.0
+                )
+
+            # ============================================
+            # 5. 速度计算
+            # ============================================
+            follow_speed = target_speed
+            front = get_front_vehicle(surrounding)
+            if front is not None:
+                fd = front['rel_dist']
+                if fd < 50.0:
+                    ratio = max(0.0, (fd - 5.0) / 45.0)
+                    follow_speed = (front['speed']
+                                    + ratio * (target_speed - front['speed']))
+                    follow_speed = max(follow_speed, 30.0)
+
+            control_speed = min(target_speed, curvature_safe_speed,
+                                follow_speed)
+
+            if state in (State.CHANGE_LEFT, State.CHANGE_RIGHT):
+                control_speed = min(control_speed, 85.0)
+
+            # ============================================
+            # 6. 控制
+            # ============================================
+            emergency = False
+            if front is not None and front['rel_dist'] < 5.0:
+                emergency = True
+
+            control = controller.run_step(
+                target_speed=control_speed,
+                trajectory=trajectory,
+                emergency_stop=emergency,
+            )
+            ego_vehicle.apply_control(control)
+
+            # ============================================
+            # 7. 日志输出
+            # ============================================
             if frame_count % 20 == 0:
-                desire = decision.debug_info.get('fuzzy_desire', 0)
-                cte = controller.debug.get('cte', 0)
-                k_adp = controller.debug.get('k_adaptive', 0)
+                gov = speed_governor.debug
+                ctrl = controller.debug
+                di = fsm.debug_info
+                traj_str = f"{len(trajectory)}pts" if trajectory else "None"
+
+                front_str = (f"d={front['rel_dist']:.1f}m "
+                             f"v={front['speed']:.1f}"
+                             if front else "None")
 
                 print(
-                    f"[Frame {frame_count:5d}] "
-                    f"State={decision.state.name:25s} | "
-                    f"Speed={ego_data['speed']:5.1f} km/h | "
-                    f"Desire={desire:.2f} | "
-                    f"CTE={cte:+.3f} | "
-                    f"K={k_adp:.3f} | "
-                    f"Traj={'Active' if active_trajectory else 'None':6s}"
+                    f"[F{frame_count:5d}] "
+                    f"{di['state']:14s} | "
+                    f"Spd={current_speed:5.1f} → {control_speed:5.1f} | "
+                    f"Curv={gov['final_speed_limit']:5.1f} | "
+                    f"Des={di['desire_effective']:.2f} | "
+                    f"H={di.get('entropy', 0):.2f} | "
+                    f"CTE={ctrl['cte']:+.2f} | "
+                    f"Front=[{front_str}] | "
+                    f"Traj={traj_str}"
                 )
 
     except KeyboardInterrupt:
-        print("\n[System] 用户中断，正在清理...")
-
+        print("\n[Main] 用户中断，正在清理...")
     except Exception as e:
-        print(f"\n[Error] {e}")
+        print(f"\n[Main] 运行异常: {e}")
         traceback.print_exc()
-
     finally:
-        # ============================================================
-        # 清理
-        # ============================================================
-        print("[Cleanup] 销毁车辆...")
+        cleanup(world, ego_vehicle, npc_vehicles)
+        print("[Main] 程序结束")
 
-        # 恢复异步模式
-        settings = world.get_settings()
-        settings.synchronous_mode = False
-        world.apply_settings(settings)
-
-        # 销毁 NPC
-        for npc in npc_vehicles:
-            try:
-                npc.destroy()
-            except Exception:
-                pass
-
-        # 销毁自车
-        try:
-            ego_vehicle.destroy()
-        except Exception:
-            pass
-
-        print("[Cleanup] 完成")
-
+# ==============================================================
 if __name__ == '__main__':
     main()

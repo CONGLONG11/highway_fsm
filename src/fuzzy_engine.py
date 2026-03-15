@@ -172,3 +172,10 @@ class FuzzyLaneChangeEngine:
             'dv_membership': dv_grades,
             'desire': round(desire, 4)
         }
+
+    def compute_desire(self, front_distance, delta_speed):
+        """
+        别名方法，供 fsm_decision.py 调用
+        实际调用 evaluate()
+        """
+        return self.evaluate(front_distance, delta_speed)

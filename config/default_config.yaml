@@ -1,0 +1,116 @@
+# ============================================
+# Highway FSM 全局配置
+# ============================================
+
+# ---- CARLA 连接 ----
+carla:
+  host: 'localhost'
+  port: 2000
+  timeout: 10.0
+  map: 'Town04'
+  sync_mode: true
+  delta_seconds: 0.05
+
+# ---- 场景 ----
+spawn_point_index: 50
+num_npc: 30
+target_speed: 100.0        # km/h
+
+# ---- 感知 ----
+perception:
+  detection_range: 100.0
+
+# ---- 决策 ----
+decision:
+  desire_threshold: 0.55
+  prep_duration: 1.0
+  abort_duration: 1.5
+  lane_change_timeout: 6.0
+  safe_front_dist: 15.0
+  safe_rear_dist: 12.0
+  use_entropy: true
+  use_counterfactual: true
+  use_phase_space: true
+
+# ---- 模糊推理 ----
+fuzzy:
+  front_distance:
+    close:  [0, 0, 15, 30]
+    medium: [20, 35, 50, 65]
+    far:    [50, 70, 100, 100]
+  speed_diff:
+    negative: [-30, -30, -10, 0]
+    zero:     [-5, 0, 0, 5]
+    positive: [0, 10, 30, 30]
+
+# ---- 轨迹规划 ----
+planner:
+  lane_change_time: 3.5
+  lane_width: 3.5
+  sample_points: 80
+  post_distance: 40.0
+
+# ---- 势场修正 ----
+risk_field:
+  eta: 50.0
+  d0: 25.0
+  lambda_weight: 0.3
+  kv: 0.05
+
+# ---- 控制器 ----
+controller:
+  k_stanley: 2.5
+  k_soft: 1.0
+  k_speed_scale: 0.08
+  min_k: 0.5
+  max_k: 5.0
+  lookahead_base: 8.0
+  lookahead_speed_factor: 0.5
+  max_lookahead: 40.0
+  curvature_ff_gain: 1.2
+  max_curvature_steer: 0.15
+  pid_kp: 1.0
+  pid_ki: 0.1
+  pid_kd: 0.05
+  max_throttle: 0.8
+  max_brake: 1.0
+
+# ---- 曲率速度调控（构想①）----
+curvature_governor:
+  a_lat_max: 3.5
+  lookahead_distance: 120.0
+  sample_spacing: 3.0
+  integral_decay: 0.85
+  integral_weight: 0.6
+  point_weight: 0.4
+  speed_margin: 5.0
+  min_speed: 30.0
+  max_speed: 120.0
+  smoothing_rate: 3.0
+
+# ---- 信息熵（构想③）----
+entropy:
+  speed_bins: 8
+  history_window: 50
+  high_entropy_threshold: 2.5
+  low_entropy_threshold: 1.0
+  min_factor: 0.3
+  smoothing: 0.85
+
+# ---- 反事实安全（构想⑤）----
+counterfactual:
+  time_horizon: 3.0
+  dt: 0.2
+  num_scenarios: 5
+  max_decel: 4.0
+  max_accel: 2.0
+  min_safe_distance: 3.0
+  safety_margin: 1.5
+
+# ---- 相空间安全（构想②）----
+phase_space:
+  reaction_time: 1.2
+  max_decel: 5.0
+  comfort_decel: 3.0
+  safety_margin: 2.0
+  ttc_threshold: 3.0

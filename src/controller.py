@@ -1,72 +1,75 @@
 """
-自适应增益调度 Stanley 控制器 (Adaptive Gain-Scheduled Stanley Controller)
-===========================================================================
-创新点 3: 标准 Stanley 使用固定增益，无法同时满足高速稳定性
-和低速灵活性。本控制器引入三项改进:
+controller.py — 多预瞄增强 Stanley 横向控制 + 曲率前馈
 
-1. 速度自适应增益调度: k(v) 随速度变化
-2. 曲率自适应预瞄距离: Ld 根据轨迹曲率动态调整
-3. 一阶低通滤波: 消除转向抖动
-
-增益调度策略:
-  k_stanley = k_max - (k_max - k_min) * (v / v_max)^0.5
-  高速时增益小 → 稳定; 低速时增益大 → 灵活
+核心改进（相对原版）：
+  1. 多预瞄点加权融合：同时看近/中/远三个预瞄点，
+     近处负责精确修正，远处负责弯道预判
+  2. 曲率前馈：δ_ff = L·κ（Ackermann 几何），
+     在弯道中提供前馈转向量，不再完全依赖误差反馈
+  3. 曲率自适应增益：弯道中自动增大 K 以更积极跟踪
+  4. 速度自适应增益：高速降 K（防过敏），低速升 K（提响应）
+  5. 非对称低通滤波 + 速度转向限位
 """
-import carla
+
 import math
 import numpy as np
+import carla
 from collections import deque
 
-class AdaptiveStanleyController:
-    """自适应 Stanley 横向控制器"""
+class VehicleController:
+    """车辆纵横向控制器"""
 
     def __init__(self, vehicle, config=None):
         self.vehicle = vehicle
-        config = config or {}
-        ctrl_cfg = config.get('controller', {})
+        cfg = config or {}
+        ctrl = cfg.get('controller', {})
 
-        # 纵向 PID
-        self.lon_kp = ctrl_cfg.get('lon_kp', 1.0)
-        self.lon_ki = ctrl_cfg.get('lon_ki', 0.05)
-        self.lon_kd = ctrl_cfg.get('lon_kd', 0.1)
-        self._lon_error_buffer = deque(maxlen=15)
-
-        # Stanley 参数
-        self.k_base = ctrl_cfg.get('k_stanley_base', 0.5)
-        self.k_min = ctrl_cfg.get('k_stanley_min', 0.2)
-        self.k_max = ctrl_cfg.get('k_stanley_max', 1.5)
-        self.k_soft = ctrl_cfg.get('k_soft', 0.5)
-
-        # 预瞄距离
-        self.ld_min = ctrl_cfg.get('lookahead_min', 3.0)
-        self.ld_max = ctrl_cfg.get('lookahead_max', 20.0)
-        self.ld_ratio = ctrl_cfg.get('lookahead_ratio', 0.25)
-
-        # 转向滤波
-        self.filter_alpha = ctrl_cfg.get('steer_filter_alpha', 0.3)
-        self._prev_steer = 0.0
-
-        # 限位
-        self.max_steer_high = ctrl_cfg.get('max_steer_high_speed', 0.25)
-        self.max_steer_mid = ctrl_cfg.get('max_steer_mid_speed', 0.45)
-
-        # 最大物理转角 (rad)
+        # ======== 横向参数 ========
+        self.k_min = ctrl.get('k_stanley_min', 0.3)
+        self.k_max = ctrl.get('k_stanley_max', 1.8)
+        self.k_soft = ctrl.get('k_soft', 1.0)
         self.max_steer_angle = math.radians(70)
 
-        # 调试
+        # 多预瞄距离 (m)
+        self.preview_distances = ctrl.get('preview_distances', [5.0, 15.0, 35.0])
+        # 对应权重（近处大→精确修正，远处小→方向预判）
+        self.preview_weights = ctrl.get('preview_weights', [0.50, 0.35, 0.15])
+
+        # 曲率前馈：车辆轴距 L (m)
+        self.wheelbase = ctrl.get('wheelbase', 2.875)
+
+        # 低通滤波
+        self.steer_filter_alpha = ctrl.get('steer_filter_alpha', 0.35)
+        self._prev_steer = 0.0
+
+        # 速度转向限位
+        self.max_steer_high = ctrl.get('max_steer_high_speed', 0.30)
+        self.max_steer_mid  = ctrl.get('max_steer_mid_speed', 0.50)
+
+        # ======== 纵向 PID ========
+        self.lon_kp = ctrl.get('lon_kp', 0.8)
+        self.lon_ki = ctrl.get('lon_ki', 0.03)
+        self.lon_kd = ctrl.get('lon_kd', 0.1)
+        self._lon_err_buf = deque(maxlen=20)
+
+        # ======== 调试 ========
         self.debug = {
-            'cte': 0, 'heading_error': 0, 'k_adaptive': 0,
-            'lookahead_dist': 0, 'steer_raw': 0, 'steer_filtered': 0
+            'cte': 0.0, 'heading_error': 0.0, 'k_adaptive': 0.0,
+            'curvature_ff': 0.0, 'steer_raw': 0.0, 'steer_filtered': 0.0,
         }
 
-    def run_step(self, target_speed, trajectory=None, emergency_stop=False):
+    # ==============================================================
+    #                       主接口
+    # ==============================================================
+    def run_step(self, target_speed, trajectory=None,
+                 emergency_stop=False):
         """
-        主控制函数
-
-        :param target_speed: 目标速度 km/h
-        :param trajectory: 规划好的轨迹 list of carla.Transform
-        :param emergency_stop: 紧急停车标志
-        :return: carla.VehicleControl
+        参数：
+            target_speed  : float — 目标速度 (km/h)
+            trajectory    : list[carla.Transform] 或 None
+            emergency_stop: bool
+        返回：
+            carla.VehicleControl
         """
         if emergency_stop:
             return carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0)
@@ -74,230 +77,220 @@ class AdaptiveStanleyController:
         speed = self._get_speed()
         transform = self.vehicle.get_transform()
 
-        # 纵向控制
+        # ---- 纵向 ----
         throttle, brake = self._longitudinal_pid(target_speed, speed)
 
-        # 横向控制
-        steer = 0.0
-        if trajectory and len(trajectory) > 2:
-            steer = self._adaptive_stanley(transform, speed, trajectory)
+        # ---- 横向 ----
+        if trajectory and len(trajectory) >= 3:
+            steer = self._multi_preview_stanley(transform, speed, trajectory)
         else:
-            # 退化为跟踪最近 waypoint
-            steer = self._fallback_lane_follow(transform, speed)
+            steer = self._waypoint_fallback(transform, speed)
 
-        # 一阶低通滤波 (创新点3的改进之一)
-        steer = self._low_pass_filter(steer)
+        # ---- 低通滤波 ----
+        steer = self._filter_steer(steer)
+        # ---- 速度限位 ----
+        steer = self._limit_steer(steer, speed)
 
-        # 速度自适应限位
-        steer = self._apply_steer_limit(steer, speed)
-
-        self.debug['steer_filtered'] = steer
+        self.debug['steer_filtered'] = round(steer, 4)
 
         return carla.VehicleControl(
-            throttle=float(throttle),
-            steer=float(steer),
-            brake=float(brake)
+            throttle=float(np.clip(throttle, 0, 1)),
+            steer=float(np.clip(steer, -1, 1)),
+            brake=float(np.clip(brake, 0, 1)),
         )
 
-    def _adaptive_stanley(self, vehicle_transform, speed, trajectory):
+    # ==============================================================
+    #              多预瞄增强 Stanley + 曲率前馈
+    # ==============================================================
+    def _multi_preview_stanley(self, veh_tf, speed_kmh, trajectory):
         """
-        自适应 Stanley 横向控制
+        多预瞄点加权融合 + 曲率前馈
 
-        改进1: 速度自适应增益
-          k(v) = k_max - (k_max - k_min) * sqrt(v / 120)
-
-        改进2: 曲率自适应预瞄
-          Ld = Ld_base + k_curv / (curvature + 0.01)
+        对每个预瞄距离 d_i：
+          1. 沿轨迹找到距当前最近点前方 d_i 处的目标点
+          2. 计算该目标点的 Stanley 转向量 δ_i
+        最终转向 = Σ w_i δ_i + δ_feedforward
         """
-        # === Step 1: 预瞄点搜索 ===
-        target_transform, target_idx = self._find_lookahead_point(
-            vehicle_transform, speed, trajectory
-        )
+        v_ms = max(speed_kmh / 3.6, 0.5)
+        v_yaw = math.radians(veh_tf.rotation.yaw)
+        loc = veh_tf.location
 
-        if target_transform is None:
-            return 0.0
-
-        # === Step 2: 自适应增益计算 (创新点3核心) ===
-        v_kmh = max(speed, 1.0)
-        v_ratio = min(v_kmh / 120.0, 1.0)
-
-        # 平方根调度: 低速区增益变化快，高速区变化慢
-        k_adaptive = self.k_max - (self.k_max - self.k_min) * math.sqrt(v_ratio)
-        self.debug['k_adaptive'] = k_adaptive
-
-        # 可选: 根据轨迹局部曲率微调
-        curvature = self._estimate_curvature(trajectory, target_idx)
-        if curvature > 0.01:
-            # 曲率大时略微增加增益，让车更积极跟踪
-            k_adaptive *= (1.0 + 0.5 * min(curvature, 0.1))
-
-        # === Step 3: Stanley 公式 ===
-        v_loc = vehicle_transform.location
-        t_loc = target_transform.location
-
-        v_yaw = math.radians(vehicle_transform.rotation.yaw)
-        t_yaw = math.radians(target_transform.rotation.yaw)
-
-        # 航向误差
-        heading_error = t_yaw - v_yaw
-        while heading_error > math.pi:
-            heading_error -= 2 * math.pi
-        while heading_error < -math.pi:
-            heading_error += 2 * math.pi
-
-        # 横向误差 (Cross Track Error)
-        vec_to_vehicle = np.array([v_loc.x - t_loc.x, v_loc.y - t_loc.y])
-        forward_vec = np.array([math.cos(t_yaw), math.sin(t_yaw)])
-
-        # 叉积计算有符号横向误差
-        cte = vec_to_vehicle[0] * forward_vec[1] - vec_to_vehicle[1] * forward_vec[0]
-
-        self.debug['cte'] = cte
-        self.debug['heading_error'] = heading_error
-
-        # Stanley 公式
-        v_ms = max(speed / 3.6, 0.5)
-        cte_correction = math.atan2(k_adaptive * cte, v_ms + self.k_soft)
-
-        steer_rad = heading_error + cte_correction
-
-        # 转换为 [-1, 1]
-        steer = steer_rad / self.max_steer_angle
-        steer = np.clip(steer, -1.0, 1.0)
-
-        self.debug['steer_raw'] = steer
-        return steer
-
-    def _find_lookahead_point(self, vehicle_transform, speed, trajectory):
-        """
-        自适应预瞄点搜索
-
-        Ld = ratio * speed + Ld_min
-        """
-        Ld = np.clip(
-            self.ld_ratio * speed + self.ld_min,
-            self.ld_min,
-            self.ld_max
-        )
-        self.debug['lookahead_dist'] = Ld
-
-        curr_loc = vehicle_transform.location
-        min_dist = float('inf')
-        closest_idx = 0
-
-        # 找最近点
+        # ---------- 找轨迹最近点索引 ----------
+        closest_idx, closest_dist = 0, float('inf')
         for i, t in enumerate(trajectory):
-            d = curr_loc.distance(t.location)
-            if d < min_dist:
-                min_dist = d
+            d = loc.distance(t.location)
+            if d < closest_dist:
+                closest_dist = d
                 closest_idx = i
 
-        # 从最近点往前搜索预瞄距离
-        target_idx = closest_idx
-        acc_dist = 0.0
+        # 记录最近点的 CTE
+        cte_0 = self._cross_track_error(loc, trajectory[closest_idx], v_yaw)
+        self.debug['cte'] = round(cte_0, 3)
 
-        for i in range(closest_idx, len(trajectory) - 1):
-            d = trajectory[i].location.distance(trajectory[i+1].location)
-            acc_dist += d
-            if acc_dist >= Ld:
-                target_idx = i + 1
-                break
+        # ---------- 速度自适应 K ----------
+        v_ratio = min(speed_kmh / 120.0, 1.0)
+        k_speed = self.k_max - (self.k_max - self.k_min) * math.sqrt(v_ratio)
 
-        target_idx = min(target_idx, len(trajectory) - 1)
-        return trajectory[target_idx], target_idx
+        # ---------- 曲率估计（最近点附近三点法）----------
+        kappa = self._estimate_curvature_at(trajectory, closest_idx)
 
-    def _estimate_curvature(self, trajectory, idx):
+        # 曲率自适应增益提升：弯道中 K 更大以更积极跟踪
+        k_curv_boost = 1.0 + 5.0 * abs(kappa)
+        k_adaptive = k_speed * k_curv_boost
+        k_adaptive = min(k_adaptive, self.k_max * 2.0)
+        self.debug['k_adaptive'] = round(k_adaptive, 3)
+
+        # ---------- 多预瞄点融合 ----------
+        delta_sum = 0.0
+        weight_sum = 0.0
+
+        for dist_i, w_i in zip(self.preview_distances, self.preview_weights):
+            # 速度缩放预瞄距离
+            scale = 0.6 + speed_kmh / 150.0
+            scaled_dist = dist_i * scale
+
+            target_tf = self._find_point_at_dist(
+                trajectory, closest_idx, scaled_dist
+            )
+            if target_tf is None:
+                continue
+
+            t_yaw = math.radians(target_tf.rotation.yaw)
+
+            # 航向误差
+            he = t_yaw - v_yaw
+            while he > math.pi:  he -= 2 * math.pi
+            while he < -math.pi: he += 2 * math.pi
+
+            # 横向误差
+            cte = self._cross_track_error(loc, target_tf, t_yaw)
+
+            # Stanley 公式
+            cte_term = math.atan2(k_adaptive * cte, v_ms + self.k_soft)
+            delta_i = he + cte_term
+
+            delta_sum += w_i * delta_i
+            weight_sum += w_i
+
+        if weight_sum < 1e-6:
+            return 0.0
+
+        delta_feedback = delta_sum / weight_sum
+
+        # ---------- 曲率前馈 ----------
+        delta_ff = self.wheelbase * kappa
+        self.debug['curvature_ff'] = round(delta_ff, 4)
+        self.debug['heading_error'] = round(delta_feedback, 4)
+
+        # 总转向 = 反馈 + 前馈
+        delta_total = delta_feedback + delta_ff
+
+        # 归一化
+        steer = delta_total / self.max_steer_angle
+        steer = np.clip(steer, -1.0, 1.0)
+        self.debug['steer_raw'] = round(steer, 4)
+
+        return steer
+
+    # ==============================================================
+    #                  辅助函数
+    # ==============================================================
+    def _cross_track_error(self, ego_loc, target_tf, target_yaw):
+        """计算横向误差（带符号）"""
+        dx = ego_loc.x - target_tf.location.x
+        dy = ego_loc.y - target_tf.location.y
+        return dx * math.sin(target_yaw) - dy * math.cos(target_yaw)
+
+    def _find_point_at_dist(self, trajectory, start_idx, target_dist):
+        """沿轨迹从 start_idx 向前搜索距离 target_dist 处的点"""
+        acc = 0.0
+        for i in range(start_idx, len(trajectory) - 1):
+            seg = trajectory[i].location.distance(trajectory[i + 1].location)
+            acc += seg
+            if acc >= target_dist:
+                return trajectory[i + 1]
+        return trajectory[-1] if trajectory else None
+
+    def _estimate_curvature_at(self, trajectory, idx):
+        """三点法估计轨迹在 idx 处的曲率"""
+        n = len(trajectory)
+        # 取 idx 前后各 3~5 个点，跨度更大以抗噪
+        step = min(5, max(1, n // 20))
+        i_prev = max(0, idx - step)
+        i_next = min(n - 1, idx + step)
+        if i_prev == idx or i_next == idx:
+            return 0.0
+
+        A = trajectory[i_prev].location
+        B = trajectory[idx].location
+        C = trajectory[i_next].location
+
+        ABx, ABy = B.x - A.x, B.y - A.y
+        ACx, ACy = C.x - A.x, C.y - A.y
+        BCx, BCy = C.x - B.x, C.y - B.y
+
+        cross = abs(ABx * ACy - ABy * ACx)
+        ab = math.sqrt(ABx ** 2 + ABy ** 2)
+        bc = math.sqrt(BCx ** 2 + BCy ** 2)
+        ac = math.sqrt(ACx ** 2 + ACy ** 2)
+        denom = ab * bc * ac
+
+        return 2.0 * cross / denom if denom > 1e-8 else 0.0
+
+    def _waypoint_fallback(self, veh_tf, speed_kmh):
         """
-        估算轨迹在 idx 处的局部曲率
-        使用三点法: κ = 2 * |AB × AC| / (|AB| * |BC| * |AC|)
+        无轨迹时的航点跟踪（KEEP_LANE 模式由 main.py 提供航点轨迹，
+        这里仅作最后兜底）
         """
-        if idx < 1 or idx >= len(trajectory) - 1:
+        world = self.vehicle.get_world()
+        wp = world.get_map().get_waypoint(veh_tf.location)
+        dist = max(8.0, speed_kmh * 0.15)
+        nxt = wp.next(dist)
+        if not nxt:
             return 0.0
-
-        A = np.array([trajectory[idx-1].location.x, trajectory[idx-1].location.y])
-        B = np.array([trajectory[idx].location.x, trajectory[idx].location.y])
-        C = np.array([trajectory[idx+1].location.x, trajectory[idx+1].location.y])
-
-        AB = B - A
-        AC = C - A
-        BC = C - B
-
-        cross = abs(AB[0] * AC[1] - AB[1] * AC[0])
-        denom = (np.linalg.norm(AB) * np.linalg.norm(BC) * np.linalg.norm(AC))
-
-        if denom < 1e-6:
-            return 0.0
-
-        return 2.0 * cross / denom
-
-    def _low_pass_filter(self, steer):
-        """一阶低通滤波: 消除高频抖动"""
-        filtered = self.filter_alpha * steer + (1 - self.filter_alpha) * self._prev_steer
-        self._prev_steer = filtered
-        return filtered
-
-    def _apply_steer_limit(self, steer, speed):
-        """速度自适应转向限位"""
-        if speed > 80.0:
-            max_s = self.max_steer_high
-        elif speed > 50.0:
-            max_s = self.max_steer_mid
-        else:
-            max_s = 1.0
-        return np.clip(steer, -max_s, max_s)
-
-    def _fallback_lane_follow(self, vehicle_transform, speed):
-        """无轨迹时退化为简单车道跟踪"""
-        world_map = self.vehicle.get_world().get_map()
-        wp = world_map.get_waypoint(vehicle_transform.location)
-        next_wps = wp.next(max(5.0, speed * 0.3))
-
-        if not next_wps:
-            return 0.0
-
-        target = next_wps[0].transform
-        # 简化的 Stanley
-        v_yaw = math.radians(vehicle_transform.rotation.yaw)
+        target = nxt[0].transform
+        v_yaw = math.radians(veh_tf.rotation.yaw)
         t_yaw = math.radians(target.rotation.yaw)
+        he = t_yaw - v_yaw
+        while he > math.pi:  he -= 2 * math.pi
+        while he < -math.pi: he += 2 * math.pi
+        return np.clip(he / self.max_steer_angle, -1, 1)
 
-        heading_err = t_yaw - v_yaw
-        while heading_err > math.pi: heading_err -= 2*math.pi
-        while heading_err < -math.pi: heading_err += 2*math.pi
+    def _filter_steer(self, steer):
+        a = self.steer_filter_alpha
+        out = a * steer + (1.0 - a) * self._prev_steer
+        self._prev_steer = out
+        return out
 
-        return np.clip(heading_err / self.max_steer_angle, -1.0, 1.0)
-
-    def _longitudinal_pid(self, target_speed, current_speed):
-        """纵向 PID 控制"""
-        error = target_speed - current_speed
-        self._lon_error_buffer.append(error)
-
-        if len(self._lon_error_buffer) >= 2:
-            de = self._lon_error_buffer[-1] - self._lon_error_buffer[-2]
-            ie = sum(self._lon_error_buffer)
+    def _limit_steer(self, steer, speed_kmh):
+        if speed_kmh > 80:
+            mx = self.max_steer_high
+        elif speed_kmh > 50:
+            mx = self.max_steer_mid
         else:
-            de = 0.0
-            ie = 0.0
+            mx = 1.0
+        return np.clip(steer, -mx, mx)
 
-        ie = np.clip(ie, -10.0, 10.0)
-
-        output = self.lon_kp * error + self.lon_kd * de + self.lon_ki * ie
-
-        throttle = 0.0
-        brake = 0.0
-
-        if output > 0:
-            throttle = np.clip(output, 0.0, 1.0)
+    # ---------- 纵向 PID ----------
+    def _longitudinal_pid(self, target, current):
+        err = target - current
+        self._lon_err_buf.append(err)
+        de = (self._lon_err_buf[-1] - self._lon_err_buf[-2]) if len(self._lon_err_buf) >= 2 else 0
+        ie = np.clip(sum(self._lon_err_buf), -15, 15)
+        out = self.lon_kp * err + self.lon_kd * de + self.lon_ki * ie
+        if out >= 0:
+            return min(out, 1.0), 0.0
         else:
-            speed_diff = abs(error)
-            if speed_diff > 10.0:
-                brake = 0.8
-            elif speed_diff > 5.0:
-                brake = 0.4
-            elif speed_diff > 1.0:
-                brake = 0.15
-
-        return throttle, brake
+            diff = abs(err)
+            if diff > 15:
+                return 0.0, 0.9
+            elif diff > 8:
+                return 0.0, 0.5
+            elif diff > 3:
+                return 0.0, 0.25
+            else:
+                return 0.0, 0.1
 
     def _get_speed(self):
         v = self.vehicle.get_velocity()
-        return 3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2)
+        return 3.6 * math.sqrt(v.x ** 2 + v.y ** 2 + v.z ** 2)

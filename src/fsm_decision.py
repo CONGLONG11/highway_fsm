@@ -1,279 +1,305 @@
 """
-模糊增强有限状态机决策模块 (Fuzzy-Enhanced FSM Decision)
-============================================================
-创新点 1: 将模糊逻辑与有限状态机、代价函数三者结合。
+fsm_decision.py — 有限状态机决策模块
 
-工作流程:
-  1. 模糊引擎计算"变道意愿度" (连续值 0~1)
-  2. 若意愿度超过阈值，触发代价函数评估
-  3. 代价函数综合 效率/安全/舒适 三维代价
-  4. FSM 根据最低代价选择最优行为
-
-状态转换图:
-  ┌───────────┐
-  │ KEEP_LANE │ ←─────────────────────────┐
-  └─────┬─────┘                           │
-        │ 意愿度 > 阈值                    │ 变道完成 / 冷却结束
-        │ 且代价评估通过                    │
-        ▼                                 │
-  ┌──────────────┐    ┌──────────────┐    │
-  │ CHANGE_LEFT  │    │ CHANGE_RIGHT │ ───┘
-  └──────────────┘    └──────────────┘
+集成创新：
+  1. 模糊意愿度（原有）
+  2. 信息熵调制（构想③）     — 混乱环境压制变道
+  3. 反事实安全验证（构想⑤） — 模拟最坏反应
+  4. 相空间安全包络（构想②） — 替代简单距离阈值
 """
-from enum import Enum
-import numpy as np
-import math
 
-from fuzzy_engine import FuzzyLaneChangeEngine
-from risk_field import RiskField
+import math
+import time
+from enum import Enum, auto
 
 class State(Enum):
-    KEEP_LANE = 0
-    PREPARE_LANE_CHANGE_LEFT = 1    # 准备变道 (触发规划)
-    LANE_CHANGE_LEFT = 2             # 正在变道 (跟踪轨迹)
-    PREPARE_LANE_CHANGE_RIGHT = 3
-    LANE_CHANGE_RIGHT = 4
+    KEEP_LANE = auto()
+    PREP_LEFT = auto()
+    PREP_RIGHT = auto()
+    CHANGE_LEFT = auto()
+    CHANGE_RIGHT = auto()
+    ABORT = auto()
 
 class FSMDecision:
+    """分层决策状态机"""
+
     def __init__(self, config=None):
-        config = config or {}
+        cfg = config or {}
+        dec = cfg.get('decision', {})
 
         self.state = State.KEEP_LANE
-        self.target_speed = config.get('target_speed', 100.0)
+        self.target_lane_id = None
+        self._state_entry_time = time.time()
 
-        # 模糊引擎
-        fuzzy_config = config.get('fuzzy', {})
-        self.fuzzy_engine = FuzzyLaneChangeEngine(fuzzy_config)
-        self.desire_threshold = fuzzy_config.get('desire_threshold', 0.6)
+        # ---- 阈值 ----
+        self.desire_threshold = dec.get('desire_threshold', 0.55)
+        self.prep_duration = dec.get('prep_duration', 1.0)
+        self.abort_duration = dec.get('abort_duration', 1.5)
+        self.lc_timeout = dec.get('lane_change_timeout', 6.0)
+        self.safe_front_dist = dec.get('safe_front_dist', 15.0)
+        self.safe_rear_dist = dec.get('safe_rear_dist', 12.0)
 
-        # 势场风险评估
-        apf_config = config.get('apf', {})
-        self.risk_field = RiskField(apf_config)
+        # ---- 模糊引擎（外部注入）----
+        self.fuzzy_engine = None
 
-        # 代价权重
-        cost_config = config.get('cost', {})
-        self.w_efficiency = cost_config.get('w_efficiency', 10.0)
-        self.w_safety = cost_config.get('w_safety', 20.0)
-        self.w_comfort = cost_config.get('w_comfort', 8.0)
-        self.w_lane_bias = cost_config.get('w_lane_bias', 2.0)
+        # ---- 信息熵分析器（构想③）----
+        from entropy_decision import TrafficEntropyAnalyzer
+        entropy_cfg = cfg.get('entropy', {})
+        self.entropy_analyzer = TrafficEntropyAnalyzer(entropy_cfg)
+        self.use_entropy = dec.get('use_entropy', True)
 
-        # 安全参数
-        safety_config = config.get('safety', {})
-        self.min_front_dist = safety_config.get('min_front_dist', 15.0)
-        self.min_side_dist = safety_config.get('min_side_dist', 8.0)
-        self.min_rear_dist = safety_config.get('min_rear_dist', 12.0)
-        self.ttc_threshold = safety_config.get('ttc_threshold', 3.0)
+        # ---- 反事实验证器（构想⑤）----
+        from counterfactual_safety import CounterfactualVerifier
+        cf_cfg = cfg.get('counterfactual', {})
+        self.cf_verifier = CounterfactualVerifier(cf_cfg)
+        self.use_counterfactual = dec.get('use_counterfactual', True)
 
-        # 冷却计时
-        self.cooldown_max = safety_config.get('lane_change_cooldown', 150)
-        self.cooldown_timer = 0
+        # ---- 相空间安全包络（构想②）----
+        from phase_space_safety import PhaseSpaceSafetyEnvelope
+        ps_cfg = cfg.get('phase_space', {})
+        self.phase_safety = PhaseSpaceSafetyEnvelope(ps_cfg)
+        self.use_phase_space = dec.get('use_phase_space', True)
 
-        # 调试信息
-        self.debug_info = {}
+        # ---- 调试 ----
+        self.debug_info = {
+            'state': 'KEEP_LANE',
+            'desire_raw': 0.0,
+            'desire_effective': 0.0,
+            'entropy': 0.0,
+            'entropy_factor': 1.0,
+            'cf_safe': True,
+            'cf_worst_dist': 999.0,
+            'target_lane': None,
+        }
 
-    def decide(self, perception_data):
+    def set_fuzzy_engine(self, engine):
+        self.fuzzy_engine = engine
+
+    # ==============================================================
+    #                       主更新入口
+    # ==============================================================
+    def update(self, ego_data, surrounding):
         """
-        主决策函数
+        每帧调用。
 
-        :param perception_data: 感知模块的输出
-        :return: State 枚举值
+        参数：
+            ego_data    : dict — 自车信息
+                {'speed': float(km/h), 'waypoint': carla.Waypoint, ...}
+            surrounding : dict — 按车道偏移分组的周围车辆
+                {0: [当前车道车辆], -1: [左车道], 1: [右车道]}
+                每辆车 {'actor_id': int, 'speed': float(km/h),
+                        'rel_dist': float(m), ...}
+
+        返回：
+            dict — {'state': State, 'target_lane_id': int or None}
         """
-        ego = perception_data['ego']
-        surrounding = perception_data['surrounding']
-        lanes = perception_data['lanes']
+        # ---- 更新信息熵 ----
+        if self.use_entropy:
+            all_vehs = []
+            for lane_vehs in surrounding.values():
+                all_vehs.extend(lane_vehs)
+            self.entropy_analyzer.update(all_vehs)
+            self.debug_info['entropy'] = self.entropy_analyzer.debug['current_entropy']
+            self.debug_info['entropy_factor'] = self.entropy_analyzer.get_modulation_factor()
 
-        # 冷却倒计时
-        if self.cooldown_timer > 0:
-            self.cooldown_timer -= 1
+        # ---- 状态机分发 ----
+        handlers = {
+            State.KEEP_LANE: self._handle_keep_lane,
+            State.PREP_LEFT: self._handle_prep,
+            State.PREP_RIGHT: self._handle_prep,
+            State.CHANGE_LEFT: self._handle_change,
+            State.CHANGE_RIGHT: self._handle_change,
+            State.ABORT: self._handle_abort,
+        }
+        handler = handlers.get(self.state, self._handle_keep_lane)
+        handler(ego_data, surrounding)
 
-        # ============================================================
-        # 状态机逻辑
-        # ============================================================
+        self.debug_info['state'] = self.state.name
+        self.debug_info['target_lane'] = self.target_lane_id
 
-        if self.state == State.KEEP_LANE:
-            return self._handle_keep_lane(ego, surrounding, lanes)
+        return {
+            'state': self.state,
+            'target_lane_id': self.target_lane_id,
+        }
 
-        elif self.state in (State.PREPARE_LANE_CHANGE_LEFT,
-                            State.PREPARE_LANE_CHANGE_RIGHT):
-            # 准备状态: 等待规划器生成轨迹, 自动跳转到执行
-            # (由 main loop 控制)
-            return self.state
+    # ==============================================================
+    #                     KEEP_LANE 状态
+    # ==============================================================
+    def _handle_keep_lane(self, ego, surr):
+        front = self._get_front_vehicle(0, surr)
 
-        elif self.state in (State.LANE_CHANGE_LEFT, State.LANE_CHANGE_RIGHT):
-            # 执行中: 由 main loop 监控轨迹完成度来切回 KEEP_LANE
-            return self.state
+        if front is None:
+            self.debug_info['desire_raw'] = 0.0
+            self.debug_info['desire_effective'] = 0.0
+            return  # 前方无车，保持车道
 
-        return State.KEEP_LANE
+        fd = front['rel_dist']
+        ds = ego['speed'] - front['speed']
 
-    def _handle_keep_lane(self, ego, surrounding, lanes):
-        """保持车道状态下的决策逻辑"""
-
-        # 如果冷却未结束，不做决策
-        if self.cooldown_timer > 0:
-            return State.KEEP_LANE
-
-        current_lane = ego['lane_id']
-
-        # ---- Step 1: 模糊推理计算变道意愿度 ----
-        front_vehicle = self._get_front_vehicle(current_lane, surrounding)
-
-        if front_vehicle is None:
-            front_dist = 999.0
-            delta_speed = 0.0
+        # ---- Step 1: 模糊意愿度 ----
+        if self.fuzzy_engine:
+            desire = self.fuzzy_engine.compute_desire(fd, ds)
         else:
-            front_dist = front_vehicle['rel_dist']
-            delta_speed = ego['speed'] - front_vehicle['speed']  # 正值=我更快
+            desire = 0.0
+        self.debug_info['desire_raw'] = round(desire, 3)
 
-        desire = self.fuzzy_engine.evaluate(front_dist, delta_speed)
+        # ---- Step 2: 信息熵调制（构想③）----
+        if self.use_entropy:
+            factor = self.entropy_analyzer.get_modulation_factor()
+            desire *= factor
+        self.debug_info['desire_effective'] = round(desire, 3)
 
-        self.debug_info['fuzzy_desire'] = desire
-        self.debug_info['front_dist'] = front_dist
-        self.debug_info['delta_speed'] = delta_speed
-
-        # ---- Step 2: 意愿度检查 ----
+        # ---- Step 3: 意愿度检查 ----
         if desire < self.desire_threshold:
-            # 不够想变道，保持车道
-            return State.KEEP_LANE
+            return
 
-        # ---- Step 3: 代价函数评估所有可行方案 ----
-        costs = {}
+        # ---- Step 4: 选择目标车道 ----
+        left_ok = self._evaluate_lane(-1, surr, ego)
+        right_ok = self._evaluate_lane(1, surr, ego)
 
-        # 当前车道代价
-        costs['keep'] = self._compute_lane_cost(
-            current_lane, current_lane, ego, surrounding, is_change=False
-        )
-
-        # 左变道代价
-        if lanes['left_available']:
-            left_lane = lanes['left_wp'].lane_id if lanes['left_wp'] else None
-            if left_lane and self._hard_safety_check(left_lane, surrounding, ego):
-                costs['left'] = self._compute_lane_cost(
-                    left_lane, current_lane, ego, surrounding, is_change=True
-                )
-            else:
-                costs['left'] = float('inf')
+        if left_ok and right_ok:
+            left_q = self._lane_quality(-1, surr, ego)
+            right_q = self._lane_quality(1, surr, ego)
+            chosen = -1 if left_q >= right_q else 1
+        elif left_ok:
+            chosen = -1
+        elif right_ok:
+            chosen = 1
         else:
-            costs['left'] = float('inf')
+            return  # 两侧都不可行
 
-        # 右变道代价
-        if lanes['right_available']:
-            right_lane = lanes['right_wp'].lane_id if lanes['right_wp'] else None
-            if right_lane and self._hard_safety_check(right_lane, surrounding, ego):
-                costs['right'] = self._compute_lane_cost(
-                    right_lane, current_lane, ego, surrounding, is_change=True
-                )
-            else:
-                costs['right'] = float('inf')
-        else:
-            costs['right'] = float('inf')
+        self._transition(State.PREP_LEFT if chosen == -1 else State.PREP_RIGHT)
+        wp = ego['waypoint']
+        target_wp = wp.get_left_lane() if chosen == -1 else wp.get_right_lane()
+        self.target_lane_id = target_wp.lane_id if target_wp else None
 
-        self.debug_info['costs'] = costs
+    # ==============================================================
+    #                     PREP 状态
+    # ==============================================================
+    def _handle_prep(self, ego, surr):
+        elapsed = time.time() - self._state_entry_time
+        direction = -1 if self.state == State.PREP_LEFT else 1
 
-        # ---- Step 4: 选择最优方案 ----
-        best = min(costs, key=costs.get)
+        # 二次安全确认
+        if not self._evaluate_lane(direction, surr, ego):
+            self._transition(State.ABORT)
+            return
 
-        if best == 'left' and costs['left'] < costs['keep']:
-            self.state = State.PREPARE_LANE_CHANGE_LEFT
-            self.cooldown_timer = self.cooldown_max
-            print(f"[Decision] >>> 左变道 | desire={desire:.2f} | costs={costs}")
-            return self.state
+        if elapsed >= self.prep_duration:
+            new_state = State.CHANGE_LEFT if direction == -1 else State.CHANGE_RIGHT
+            self._transition(new_state)
 
-        elif best == 'right' and costs['right'] < costs['keep']:
-            self.state = State.PREPARE_LANE_CHANGE_RIGHT
-            self.cooldown_timer = self.cooldown_max
-            print(f"[Decision] >>> 右变道 | desire={desire:.2f} | costs={costs}")
-            return self.state
+    # ==============================================================
+    #                    CHANGE 状态
+    # ==============================================================
+    def _handle_change(self, ego, surr):
+        elapsed = time.time() - self._state_entry_time
+        direction = -1 if self.state == State.CHANGE_LEFT else 1
 
-        return State.KEEP_LANE
+        # 超时检查
+        if elapsed > self.lc_timeout:
+            self._transition(State.KEEP_LANE)
+            self.target_lane_id = None
+            return
 
-    def _compute_lane_cost(self, target_lane, current_lane, ego, surrounding,
-                           is_change=False):
+        # 到达目标车道？
+        wp = ego['waypoint']
+        if self.target_lane_id is not None and wp.lane_id == self.target_lane_id:
+            self._transition(State.KEEP_LANE)
+            self.target_lane_id = None
+
+    # ==============================================================
+    #                     ABORT 状态
+    # ==============================================================
+    def _handle_abort(self, ego, surr):
+        elapsed = time.time() - self._state_entry_time
+        if elapsed >= self.abort_duration:
+            self._transition(State.KEEP_LANE)
+            self.target_lane_id = None
+
+    # ==============================================================
+    #                   车道评估（三层安全）
+    # ==============================================================
+    def _evaluate_lane(self, direction, surr, ego):
         """
-        综合代价函数
+        综合三层安全检查：
+          Layer 1: 距离硬约束（原有）
+          Layer 2: 相空间安全包络（构想②）
+          Layer 3: 反事实安全验证（构想⑤）
 
-        Cost = w_eff * C_efficiency + w_safe * C_safety + w_com * C_comfort
+        全部通过才允许变道。
         """
-        cost = 0.0
+        # --- 车道存在性检查 ---
+        wp = ego['waypoint']
+        target_wp = wp.get_left_lane() if direction == -1 else wp.get_right_lane()
+        if target_wp is None:
+            return False
+        # 检查是否是同方向车道
+        if target_wp.lane_type != wp.lane_type:
+            return False
 
-        # --- A. 效率代价: 期望速度损失 ---
-        front = self._get_front_vehicle(target_lane, surrounding)
-        expected_speed = self.target_speed
+        target_vehs = surr.get(direction, [])
 
-        if front is not None:
-            fd = front['rel_dist']
-            if fd < 80.0:
-                # 期望速度受限于前车
-                expected_speed = min(self.target_speed, front['speed'])
-                # 距离越近，限速越严
-                if fd < 30.0:
-                    expected_speed *= (fd / 30.0)
+        front = self._get_front_vehicle(direction, surr)
+        rear = self._get_rear_vehicle(direction, surr)
 
-        speed_loss = (self.target_speed - expected_speed) / self.target_speed
-        cost += self.w_efficiency * max(0.0, speed_loss)
+        # ---- Layer 1: 距离硬约束 ----
+        if front and front['rel_dist'] < self.safe_front_dist:
+            return False
+        if rear and abs(rear['rel_dist']) < self.safe_rear_dist:
+            return False
 
-        # --- B. 安全代价: 势场风险评分 ---
-        ego_pos = np.array([ego['location'].x, ego['location'].y])
-        obs_list = []
-        if target_lane in surrounding:
-            for v in surrounding[target_lane]:
-                obs_list.append({
-                    'pos': np.array([v['location'].x, v['location'].y]),
-                    'vel': np.array([v['velocity'].x, v['velocity'].y]),
-                })
-        risk = self.risk_field.evaluate_lane_risk(ego_pos, obs_list)
-        cost += self.w_safety * risk * 0.1
+        # ---- Layer 2: 相空间安全包络（构想②）----
+        if self.use_phase_space:
+            fd = front['rel_dist'] if front else 200.0
+            fs = front['speed'] if front else ego['speed']
+            rd = abs(rear['rel_dist']) if rear else 200.0
+            rs = rear['speed'] if rear else ego['speed']
 
-        # --- C. 舒适代价: 变道惩罚 ---
-        if is_change:
-            cost += self.w_comfort
-
-        return round(cost, 3)
-
-    def _hard_safety_check(self, target_lane, surrounding, ego):
-        """硬性安全检查 (一票否决)"""
-        if target_lane not in surrounding:
-            return True
-
-        for v in surrounding[target_lane]:
-            rd = v['rel_dist']
-            rs = v['rel_speed']
-
-            # 盲区
-            if abs(rd) < self.min_side_dist:
+            ps_result = self.phase_safety.check_lane_change(
+                fd, fs, rd, rs, ego['speed']
+            )
+            if not ps_result['overall_safe']:
                 return False
 
-            # 前方安全距离
-            if 0 < rd < self.min_front_dist:
+        # ---- Layer 3: 反事实安全验证（构想⑤）----
+        if self.use_counterfactual and target_vehs:
+            cf_result = self.cf_verifier.verify(
+                ego_speed_ms=ego['speed'] / 3.6,
+                target_vehicles=target_vehs,
+                direction=float(direction),
+            )
+            self.debug_info['cf_safe'] = cf_result['safe']
+            self.debug_info['cf_worst_dist'] = cf_result['worst_distance']
+            if not cf_result['safe']:
                 return False
-
-            # 后方
-            if rd < 0:
-                if abs(rd) < self.min_rear_dist:
-                    return False
-                # TTC 检查
-                if rs > 3.0:
-                    ttc = abs(rd) / (rs / 3.6)
-                    if ttc < self.ttc_threshold:
-                        return False
 
         return True
 
-    def _get_front_vehicle(self, lane_id, surrounding):
-        if lane_id not in surrounding:
-            return None
-        for v in surrounding[lane_id]:
-            if v['rel_dist'] > 3.0:
-                return v
-        return None
+    # ==============================================================
+    #                       辅助函数
+    # ==============================================================
+    def _lane_quality(self, direction, surr, ego):
+        """车道质量评分（用于左右二选一）"""
+        front = self._get_front_vehicle(direction, surr)
+        if front is None:
+            return 1.0
+        dist_score = min(front['rel_dist'] / 100.0, 1.0)
+        speed_score = min(front['speed'] / ego['speed'], 1.0) if ego['speed'] > 0 else 1.0
+        return 0.5 * dist_score + 0.5 * speed_score
 
-    def notify_lane_change_complete(self):
-        """由 main loop 调用，通知变道完成"""
-        self.state = State.KEEP_LANE
-        print("[Decision] 变道完成，回归 KEEP_LANE")
+    def _get_front_vehicle(self, lane_offset, surr):
+        """获取指定车道偏移中的最近前车"""
+        vehs = surr.get(lane_offset, [])
+        fronts = [v for v in vehs if v['rel_dist'] > 0]
+        return min(fronts, key=lambda v: v['rel_dist']) if fronts else None
 
-    def notify_lane_change_start(self):
-        """由 main loop 调用，通知轨迹已生成，开始执行"""
-        if self.state == State.PREPARE_LANE_CHANGE_LEFT:
-            self.state = State.LANE_CHANGE_LEFT
-        elif self.state == State.PREPARE_LANE_CHANGE_RIGHT:
-            self.state = State.LANE_CHANGE_RIGHT
+    def _get_rear_vehicle(self, lane_offset, surr):
+        """获取指定车道偏移中的最近后车"""
+        vehs = surr.get(lane_offset, [])
+        rears = [v for v in vehs if v['rel_dist'] < 0]
+        return max(rears, key=lambda v: v['rel_dist']) if rears else None
+
+    def _transition(self, new_state):
+        self.state = new_state
+        self._state_entry_time = time.time()
